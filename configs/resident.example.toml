@@ -1,0 +1,30 @@
+backend = "bosc-resident"
+state_dir = "./state"
+token_file = "./service.token"
+bind = "127.0.0.1"
+port = 8765
+poll_interval = 1
+queue_capacity = 256
+cooldown_seconds = 5
+retention_days = 7
+
+[resident]
+profile = "nh-only"
+hardware_project = "/path/to/existing-hardware-project"
+# Shared with every legacy/resident deployment that can operate these ports.
+# Administrator provisions directory access for the service account.
+lock_dir = "/path/to/shared/scheduler-locks"
+startup_timeout = 300
+command_timeout = 60
+uart_quiet_seconds = 0.2
+recovery_attempts = 3
+recovery_backoff = 10
+max_job_log_bytes = 1048576
+max_session_log_bytes = 4194304
+max_storage_bytes = 1073741824
+
+[[nodes]]
+id = "local"
+ports = [4, 5]
+uvhs_shell = "/path/to/vendor/bin/uvhs2_shell"
+uart_prefix = "/dev/FPGA"

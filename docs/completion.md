@@ -43,8 +43,8 @@ bare_runtime_report_exit、bare_runtime_report_trap。本仓库的
 hello 已独立移植到 [examples/hello](../examples/hello/README.md)，依赖的 CRT、
 运行时和 UART 驱动均位于 `runtime/bosc`。Makefile 默认链接完成协议，
 `tools/build_hello.py` 使用本仓库源码生成普通或故障变体及其 manifest。
-原 Buddy 工程的 hook 接入补丁保存在 `patches/buddy-hello-uart.patch`，供接入其他
-工作区时参考；本仓库构建直接使用已经包含这些 hook 的本地运行时。
+本仓库构建直接使用已经包含这些 hook 的本地运行时；其他应用接入时可参考
+`runtime/bosc/bare_runtime.c` 的调用位置，并链接 `uart_protocol.c`，不需要修改外部 Buddy 工作区。
 
 构建默认 hello 时只链接公共协议实现。验收用的返回 7、非法指令、等待不退出包装
 位于 [tests/fixtures/bosc_main_faults.c](../tests/fixtures/bosc_main_faults.c)，仅在

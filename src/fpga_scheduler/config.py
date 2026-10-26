@@ -40,6 +40,7 @@ class Config:
     retention_days: float = 7
     transfer_timeout: float = 120
     simulator: dict = field(default_factory=dict)
+    resident: dict = field(default_factory=dict)
 
 
 def load(path):
@@ -50,8 +51,8 @@ def load(path):
     if set(data) - allowed:
         raise ValueError(f'Unknown config fields: {sorted(set(data) - allowed)}')
     backend = data.get('backend')
-    if backend not in ('simulator', 'bosc'):
-        raise ValueError('backend must be simulator or bosc')
+    if backend not in ('simulator', 'bosc', 'bosc-resident'):
+        raise ValueError('backend must be simulator, bosc or bosc-resident')
     for name in ('state_dir', 'token_file'):
         value = data.get(name)
         if not isinstance(value, str) or not value:
@@ -116,4 +117,36 @@ def load(path):
         values = sim.get(name, [])
         if not isinstance(values, list) or any(v not in {n.id for n in nodes} for v in values):
             raise ValueError(f'Invalid simulator {name}')
+    if backend == 'bosc-resident':
+        if len(nodes) != 1 or any(p > 7 for p in nodes[0].ports):
+            raise ValueError('bosc-resident requires one local node with ports in 0..7')
+        if nodes[0].ssh_host or nodes[0].relay_command:
+            raise ValueError('bosc-resident does not use SSH or a relay')
+        if not Path(nodes[0].uvhs_shell).is_absolute():
+            raise ValueError('Resident uvhs_shell must be an absolute executable path')
+    if not isinstance(data.get('resident', {}), dict):
+        raise ValueError('resident must be a table')
+    resident = dict(data.get('resident', {}))
+    fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout',
+              'uart_quiet_seconds', 'recovery_attempts', 'recovery_backoff',
+              'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile'}
+    if set(resident) - fields:
+        raise ValueError('Unknown resident options')
+    if backend == 'bosc-resident':
+        if resident.get('profile', 'nh-only') != 'nh-only':
+            raise ValueError('Only the nh-only resident profile is supported')
+        if not resident.get('hardware_project') or not resident.get('lock_dir'):
+            raise ValueError('Resident hardware_project and shared lock_dir are required')
+    for name in ('hardware_project', 'lock_dir'):
+        if name in resident:
+            if not isinstance(resident[name], str) or not resident[name] or any(c in resident[name] for c in ('\x00', '\n', '\r')):
+                raise ValueError(f'Invalid resident {name}')
+            resident[name] = str((path.parent / resident[name]).resolve())
+    for name in fields - {'hardware_project', 'lock_dir', 'profile'}:
+        if name in resident:
+            positive(resident[name], name)
+    for name in ('recovery_attempts', 'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes'):
+        if name in resident and type(resident[name]) is not int:
+            raise ValueError(f'{name} must be an integer')
+    data['resident'] = resident
     return Config(**data)

@@ -23,6 +23,8 @@ class JobQueue:
             raise ValueError('Invalid backend nodes')
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('PRAGMA synchronous=FULL')
         self.lock = threading.RLock()
         self.dispatch_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
@@ -43,8 +45,12 @@ class JobQueue:
             self.db.execute('CREATE INDEX IF NOT EXISTS jobs_state_seq ON jobs(state,seq)')
             self.db.execute('''CREATE TABLE IF NOT EXISTS cooldowns (
                 node TEXT NOT NULL, fpga INTEGER NOT NULL, until REAL NOT NULL, PRIMARY KEY(node,fpga))''')
-            self.db.execute("UPDATE jobs SET state='failed',finished=?,error=? WHERE state='running'",
-                            (time.time(), 'Service restarted; execution outcome unknown; not replayed'))
+            for row in self.db.execute("SELECT * FROM jobs WHERE state='running'").fetchall():
+                result = backend.recover(dict(row)) if hasattr(backend, 'recover') else None
+                self.db.execute("UPDATE jobs SET state=?,finished=?,result=?,error=? WHERE id=?",
+                                ('completed' if result and result['exit_code'] == 0 else 'failed',
+                                 time.time(), json.dumps(result) if result else None,
+                                 None if result else 'Service restarted; execution outcome unknown; not replayed', row['id']))
 
     def start(self):
         if self.dispatcher is not None:
@@ -66,6 +72,8 @@ class JobQueue:
                 worker.join()
             if self.maintenance is not None:
                 self.maintenance.join()
+            if hasattr(self.backend, 'close'):
+                self.backend.close()
             with self.lock:
                 if not self.closed:
                     self.db.close()
@@ -265,6 +273,7 @@ class JobQueue:
                     (state, json.dumps(result) if result else None, error,
                      None if state == 'queued' else time.time(), None if state == 'queued' else port,
                      None if state == 'queued' else node, state == 'queued', job['id']))
+                self.db.commit()
                 self.reserved.discard((node, port))
                 if state == 'failed':
                     self.db.execute('INSERT OR REPLACE INTO cooldowns VALUES (?,?,?)', (node, port, time.time() + self.cooldown))

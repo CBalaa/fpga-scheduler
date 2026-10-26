@@ -1,0 +1,17 @@
+# Substitute all @...@ placeholders. Install only through your normal operations process.
+[Unit]
+Description=FPGA Scheduler local resident service
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DEPLOY_DIR@
+ExecStart=@VENV@/bin/fpga-scheduler serve --config @CONFIG@
+Restart=on-failure
+RestartSec=10
+KillMode=mixed
+TimeoutStopSec=720
+UMask=0077
+
+[Install]
+WantedBy=default.target

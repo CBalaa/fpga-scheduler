@@ -10,10 +10,11 @@ from .models import Conflict, MAX_IMAGE, task_id
 
 
 class Images:
-    def __init__(self, root):
+    def __init__(self, root, max_bytes=None):
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
+        self.max_bytes = max_bytes
 
     def path(self, ident):
         return self.root / task_id(ident) / 'input.bin'
@@ -25,6 +26,11 @@ class Images:
         with self.lock:
             if (path.parent / 'sha256').exists():
                 raise Conflict('Submitted input is immutable')
+            if self.max_bytes is not None:
+                used = sum(p.stat().st_size for p in self.root.rglob('input.bin'))
+                previous = path.stat().st_size if path.exists() else 0
+                if used - previous + len(content) > self.max_bytes:
+                    raise OverflowError('Input storage quota exceeded; active inputs are protected')
             path.parent.mkdir(exist_ok=True)
             temporary = None
             try:

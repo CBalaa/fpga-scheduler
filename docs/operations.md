@@ -2,7 +2,8 @@
 
 ## 本地和内网服务
 
-服务从显式 --config 启动，必须存在 owner-only 的令牌文件（600/400），
+服务从 --config 或环境变量 FPGA_SCHEDULER_CONFIG 指定的配置启动，显式 --config 优先；
+环境变量未设置或为空时，仍必须传 --config。必须存在 owner-only 的令牌文件（600/400），
 用 init-token 创建。默认监听本机回环；共享给团队时显式配置内网 bind 地址，
 跨不可信网络使用 HTTPS 反向代理。所有调用者共用令牌，具有同等任务权限。
 
@@ -17,31 +18,49 @@ queued 留在数据库待重启。必须保留充足停机时间，BOSC 默认�
 GET /health 只表明服务和调度线程存活；GET /devices 才会探测硬件。
 日志保留任务 ID 和错误，不记录请求令牌或上传文件正文；SDK/CLI 输出可保存为证据。
 
-## Compose
+## 服务器本机部署
 
-在仓库根目录、激活虚拟环境后执行：
+按 [README](../README.md) 在 FPGA 服务器的用户目录准备 Python 3.11+、虚拟环境、
+配置和 token，使用 bosc-resident 后端直接管理本机硬件。当前部署不依赖容器或 VM/VPN
+管理脚本；网络接入和厂商环境由管理员单独准备。
+
+使用 README 默认部署路径时，在加载厂商环境的服务器 shell 中执行：
 
 ~~~bash
-fpga-scheduler init-token secrets/service.token
-mkdir -p state
-export FPGA_UID=$(id -u)
-export FPGA_GID=$(id -g)
-docker compose -f deploy/compose.yml config -q
-docker compose -f deploy/compose.yml up -d --build
-fpga-scheduler --token-file secrets/service.token health
+. "$HOME/fpga-resident-deploy/env.sh"
+fpga-scheduler daemon start
+fpga-scheduler health
+fpga-scheduler daemon status
+# 停止时等待运行任务和硬件清理，保留 queued
+fpga-scheduler daemon stop
 ~~~
 
-Compose 默认仅映射 127.0.0.1:8765，使用 simulator.toml；容器镜像默认账号 10001。
-FPGA_UID/FPGA_GID 指定当前宿主账号，让 bind mount 的 state 和 600 token 可访问。
-请勿将权限扩大到全局可读。FPGA_PORT、FPGA_STATE_DIR、FPGA_CONFIG、FPGA_TOKEN_FILE
-可覆盖默认路径；相对 bind mount 路径以 deploy/compose.yml 所在目录为基准。
+构建部署、CLI/Python 执行和局域网访问见 README，硬件初始化与限制见
+[常驻运行时](resident-runtime.md)，卸载步骤见本文。
+可选的 systemd 模板仅用于管理员另行托管前台 serve，不与 daemon supervisor 同时使用。
 
-BOSC 使用覆盖配置挂载 SSH 配置/私钥/known_hosts 到固定容器路径，TOML 的 ssh_config
-指向容器内路径。配置本地路径必须使用容器内绝对值，例如 state_dir=/var/lib/fpga-scheduler、
-token_file=/run/secrets/service.token。默认 Compose 不包含任何 SSH 凭据或 VPN 登录。
+## 卸载
 
-stop_grace_period 为 20 分钟。容器健康检查带认证调用 /health；不因硬件离线反复
-重启服务。Docker 守护进程不可用时，仍可用本地 Python 完成全部离线验收。
+使用原部署账号和配置正常停止，确认 supervisor_alive 为 false、硬件清理完成后再移走部署：
+
+~~~bash
+. "$HOME/fpga-resident-deploy/env.sh"
+fpga-scheduler daemon stop
+fpga-scheduler daemon status
+# 确认已停止后，保留一份包含队列、结果、token 的备份
+FPGA_RETIRED_DIR="$FPGA_DEPLOY_DIR.retired-$(date +%Y%m%d-%H%M%S)"
+mv -- "$FPGA_DEPLOY_DIR" "$FPGA_RETIRED_DIR"
+~~~
+
+如果停止失败或仍在清理，不执行移动或删除。移除自己 shell 启动文件中的 env.sh 加载行，
+重新打开终端。确认不需要历史队列和结果后，可删除刚保留的目录：
+
+~~~bash
+rm -rf -- "$FPGA_RETIRED_DIR"
+~~~
+
+不要删除共享锁目录、硬件工程、厂商软件或其他部署依赖的 Python。
+如果另行安装了 systemd 单元，应先按实际部署方式停止、禁用并移除单元。
 
 ## 备份、恢复与回滚
 
@@ -67,3 +86,12 @@ stop_grace_period 为 20 分钟。容器健康检查带认证调用 /health；�
 输入都受保护。未提交的孤立上传以目录年龄清理。BOSC 远端独立清理陈旧运行和
 上传目录，执行中目录持有 active.lock 不删除。可配置 retention_days；真实环境
 需预留输入、readback 和日志空间。设置短保留期会缩短查询与幂等去重窗口。
+
+## 本机常驻模式
+
+新增 bosc-resident，使用 daemon start/status/stop 管理用户态 supervisor；
+配置路径由 --config 或 FPGA_SCHEDULER_CONFIG 指定。
+完整安装、共享令牌分发、端口锁、板级恢复与限制见 [常驻运行时](resident-runtime.md)。
+正常 stop 会 drain 并卸载；更换白名单之前用旧配置正常停止。
+使用 systemd 时运行 serve，避免叠加 supervisor。SQLite WAL 与主库须一起备份，
+推荐停服后复制完整 state_dir；不导入旧系统历史任务。

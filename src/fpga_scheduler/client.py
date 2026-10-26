@@ -168,11 +168,7 @@ class Client:
             task = self.wait(task.id, timeout=queue_timeout + timeout + 300,
                              on_update=(lambda t: print(f'[FPGA] {t.state} position={t.position} node={t.node} port={t.fpga}', flush=True)) if show else None)
         except KeyboardInterrupt:
-            try:
-                self.cancel(task.id)
-                print(f'[FPGA] Cancelled queued task {task.id}', flush=True)
-            except SchedulerError:
-                print(f'[FPGA] Query task {task.id}; it may already be running', flush=True)
+            print(f'[FPGA] Task remains queryable: {task.id}', flush=True)
             raise
         if task.result is None:
             raise SchedulerError(task.error or f'Task {task.state}', ident=task.id)

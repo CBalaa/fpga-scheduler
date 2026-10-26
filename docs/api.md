@@ -94,7 +94,7 @@ submit 上传后提交，仅在 POST 响应丢失时以同 ID 同参数重试一
 
 run_test(image, timeout=600, idle_seconds=60, queue_timeout=3600, show=True)
 封装提交和等待，立即打印 ID；返回 Result。若没有执行结果则抛 SchedulerError。
-执行非零退出码仍返回 Result(ok=False)。Ctrl-C 尝试取消排队任务；已运行则保留任务。
+执行非零退出码仍返回 Result(ok=False)。Ctrl-C 保留已接收任务；保存 ID 后可重新查询。
 
 ## CLI
 
@@ -117,3 +117,11 @@ fpga-scheduler [--endpoint URL] [--token-file PATH] [--json] <command>
 不从命令行接收令牌内容，避免进入进程参数或 shell 历史。--json 输出单个 JSON；
 错误写 stderr。成功为退出码 0，wait 得到 failed/cancelled 或普通错误为 1，
 Ctrl-C 为 130。submit 成功仅代表任务已接收。
+
+## Resident 模式
+
+HTTP 路由和 SDK 方法保持不变。devices 增加 state（READY/BUSY/RECOVERING/QUARANTINED）、
+session 和 downloads；首次初始化可提高 Client(request_timeout=360)。
+Result.details 包含 session、uvhs_pid、fpga、downloads、ddr_readback_matches、reset_confirmed。
+应用 exit 0 而收尾失败时 ok=False。run_test Ctrl-C 不取消已接收任务。
+CLI 新增 daemon start/status/stop --config <file>。

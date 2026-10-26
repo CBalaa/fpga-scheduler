@@ -52,7 +52,7 @@ ssh_host 是 OpenSSH alias。账号、私钥、known_hosts 和 ProxyJump 配在�
 命令通过 argv/引号传递，不把用户输入当跳板启动代码。没有运行后的重连重放。
 
 可直接通过网络/VPN 访问目标；需要跳板时在 alias 配置 ProxyJump。
-现有 QEMU/UniVPN 管理资料在 deploy/legacy-access/，不会被默认启动。
+网络接入由管理员在本项目之外配置，本仓库不提供 QEMU/UniVPN 托管脚本。
 
 如果必须经现有 VM 的命令转发入口，部署 remote/relay.py，并显式传入 JSON 配置：
 

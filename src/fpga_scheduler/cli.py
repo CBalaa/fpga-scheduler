@@ -13,12 +13,20 @@ from .client import Client, SchedulerError
 
 def parser():
     p = argparse.ArgumentParser(prog='fpga-scheduler')
+    default_config = os.environ.get('FPGA_SCHEDULER_CONFIG') or None
     p.add_argument('--endpoint', default=os.environ.get('FPGA_SCHEDULER_URL', 'http://127.0.0.1:8765'))
     p.add_argument('--token-file', default=os.environ.get('FPGA_SCHEDULER_TOKEN_FILE'))
     p.add_argument('--json', action='store_true', help='Emit machine-readable JSON')
     commands = p.add_subparsers(dest='command', required=True)
     serve = commands.add_parser('serve')
-    serve.add_argument('--config', required=True)
+    serve.add_argument('--config', default=default_config, required=default_config is None,
+                       help='Configuration file (default: FPGA_SCHEDULER_CONFIG)')
+    daemon = commands.add_parser('daemon')
+    actions = daemon.add_subparsers(dest='action', required=True)
+    for action in ('start', 'status', 'stop', '_supervise'):
+        action_parser = actions.add_parser(action)
+        action_parser.add_argument('--config', default=default_config, required=default_config is None,
+                                   help='Configuration file (default: FPGA_SCHEDULER_CONFIG)')
     token = commands.add_parser('init-token')
     token.add_argument('path')
     submit = commands.add_parser('submit')
@@ -53,11 +61,22 @@ def main(argv=None):
                 handle.write(secrets.token_urlsafe(32) + '\n')
             print(json.dumps({'token_file': str(path)}) if args.json else f'Created token file: {path}')
             return 0
+        if args.command == 'daemon':
+            from . import daemon
+            if args.action == '_supervise':
+                daemon.supervise(args.config)
+                return 0
+            print(json.dumps(getattr(daemon, args.action)(args.config), ensure_ascii=False, indent=2))
+            return 0
         if args.command == 'serve':
             from .config import load
             from .service import Application
-            logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
-            Application(load(args.config)).serve()
+            from logging.handlers import RotatingFileHandler
+            config = load(args.config)
+            config.state_dir.mkdir(parents=True, exist_ok=True)
+            logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
+                                handlers=[RotatingFileHandler(config.state_dir / 'service.log', maxBytes=1048576, backupCount=3)])
+            Application(config).serve()
             return 0
         client = Client(args.endpoint, token_file=args.token_file)
         if args.command == 'submit':

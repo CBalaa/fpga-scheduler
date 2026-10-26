@@ -97,7 +97,7 @@ def make_server(address, queue, images, token):
                 if self.command == 'GET' and route == '/health':
                     alive = queue.dispatcher is not None and queue.dispatcher.is_alive()
                     ok = alive and not queue.stopping.is_set()
-                    self.reply(200 if ok else 503, dict(service='fpga-scheduler', backend=type(queue.backend).__name__,
+                    self.reply(200 if ok else 503, dict(service='fpga-scheduler', pid=os.getpid(), backend=type(queue.backend).__name__,
                                                       dispatcher_alive=alive, stopping=queue.stopping.is_set(),
                                                       hardware_checked=False, scheduler_error=queue.status_error))
                 elif self.command == 'GET' and route == '/devices':
@@ -152,15 +152,22 @@ class Application:
         self.token = read_token(config.token_file)
         self.state_lock = StateLock(config.state_dir)
         self.queue = None
+        self.backend = None
         self.server = None
         self.closed = False
         try:
-            images = Images(config.state_dir / 'images')
+            images = Images(config.state_dir / 'images',
+                            max_bytes=config.resident.get('max_storage_bytes', 1073741824) // 2
+                            if config.backend == 'bosc-resident' else None)
             if config.backend == 'simulator':
                 backend = Simulator(config.nodes, **config.simulator)
+            elif config.backend == 'bosc-resident':
+                from .backends.resident import Resident
+                backend = Resident(config.nodes, config.state_dir, **config.resident)
             else:
                 from .backends.bosc import BOSC
                 backend = BOSC(config.nodes, transfer_timeout=config.transfer_timeout)
+            self.backend = backend
             self.queue = JobQueue(config.state_dir / 'jobs.sqlite3', backend, images,
                                   interval=config.poll_interval, capacity=config.queue_capacity,
                                   cooldown=config.cooldown_seconds, retention=config.retention_days * 86400)
@@ -182,6 +189,8 @@ class Application:
             self.server.server_close()
         if self.queue:
             self.queue.close()
+        elif self.backend is not None and hasattr(self.backend, 'close'):
+            self.backend.close()
         self.state_lock.close()
 
     def serve(self):
