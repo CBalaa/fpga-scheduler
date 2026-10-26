@@ -1,0 +1,17 @@
+backend = "simulator"
+state_dir = "/var/lib/fpga-scheduler"
+token_file = "/run/secrets/service.token"
+bind = "0.0.0.0"
+port = 8765
+poll_interval = 0.2
+
+[simulator]
+duration = 1.0
+
+[[nodes]]
+id = "sim-a"
+ports = [4, 5]
+
+[[nodes]]
+id = "sim-b"
+ports = [4, 5]

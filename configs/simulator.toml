@@ -1,0 +1,18 @@
+backend = "simulator"
+state_dir = "../state"
+token_file = "../secrets/service.token"
+bind = "127.0.0.1"
+port = 8765
+poll_interval = 0.2
+# Queue defaults: capacity=256, cooldown_seconds=60, retention_days=7.
+
+[simulator]
+duration = 1.0
+
+[[nodes]]
+id = "sim-a"
+ports = [4, 5]
+
+[[nodes]]
+id = "sim-b"
+ports = [4, 5]

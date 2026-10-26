@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpga-scheduler"
+version = "0.1.0"
+description = "Durable multi-user FPGA job queue with simulator and BOSC/UVHS backends"
+requires-python = ">=3.11"
+license = {text = "Apache-2.0"}
+readme = "README.md"
+dependencies = []
+
+[project.scripts]
+fpga-scheduler = "fpga_scheduler.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

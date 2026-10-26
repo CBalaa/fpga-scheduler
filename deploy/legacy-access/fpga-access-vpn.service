@@ -1,0 +1,20 @@
+[Unit]
+Description=FPGA scheduler UniVPN connection
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=root
+EnvironmentFile=-/etc/fpga-scheduler/access-vpn.env
+ExecStart=/usr/bin/python3 /usr/local/lib/fpga-scheduler/vpn.py
+LoadCredential=vpn.json:/etc/fpga-scheduler/vpn.json
+Restart=always
+RestartSec=60
+RestartPreventExitStatus=78
+TimeoutStopSec=20
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

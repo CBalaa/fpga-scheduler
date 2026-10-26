@@ -1,0 +1,27 @@
+backend = "bosc"
+state_dir = "../state"
+token_file = "../secrets/service.token"
+bind = "127.0.0.1"
+port = 8765
+poll_interval = 3.0
+transfer_timeout = 120
+
+[[nodes]]
+id = "bosc-a"
+ssh_host = "fpga-a" # OpenSSH alias; configure ProxyJump/keys/known_hosts externally.
+root = "/path/to/remote/fpga-platform"
+python = "python3"
+uvhs_shell = "/path/to/uvhs2_shell"
+uart_prefix = "/dev/FPGA"
+ports = [4, 5, 6, 7]
+# Optional: ssh_config = "/run/fpga/ssh/config"
+# Optional compatibility: relay_command = ["ssh", "access-host", "python3 /path/to/relay.py"]
+
+[[nodes]]
+id = "bosc-b"
+ssh_host = "fpga-b"
+root = "/path/to/remote/fpga-platform"
+python = "python3"
+uvhs_shell = "/path/to/uvhs2_shell"
+uart_prefix = "/dev/FPGA"
+ports = [4, 5, 6, 7]

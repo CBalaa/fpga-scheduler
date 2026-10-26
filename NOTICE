@@ -1,0 +1,32 @@
+FPGA Scheduler
+
+Includes code adapted from buddy-caas, licensed under Apache License 2.0.
+Reference commit: 34268ca6c0daac3910a3efe411bf0414d090e7be
+
+Adapted components: deploy/jupyterhub/fpga_jobs.py, fpga_images.py,
+fpga_bridge.py, bosc_runtime.py, bosc_hostname.py, bosc-access/prepare_runtime.py,
+the platform device/fpga.py client, and the optional bosc-access VM/VPN
+supervisors and systemd service files.
+
+Changes: standalone packaging, configurable nodes and paths, explicit image API,
+shared-token authentication, simulator, SDK/CLI, lifecycle and retention fixes,
+and a strict UART completion runner that preserves application return values.
+The optional VM/VPN templates use configurable paths, profiles and backend
+probe hosts; original deployment-specific account paths and addresses are removed.
+Original license is reproduced in LICENSE. Hardware vendor tools and databases
+are external deployment inputs and are not distributed by this project.
+
+Also includes code adapted from buddy-mlir-for-fpga, licensed under
+Apache License 2.0:
+- examples/BOSCAMEFPGA/hello: hello.c, makefile and platform/hello_nr.ld,
+  now under examples/hello/.
+- examples/BOSCAMEFPGA/common/runtime: crt_uart.S, encoding.h,
+  bare_runtime.c and bare_runtime.h, now under runtime/bosc/.
+- runtime/boscame/uart: uart.c and uart.h, now under runtime/bosc/.
+
+Changes: repository-local standalone builds, scheduler UART completion hooks,
+configurable GNU/LLVM tools, a 5.5296 MHz default clock and explicit fault variants.
+The source license headers are retained. patches/buddy-hello-uart.patch retains
+the original Buddy integration changes as a reference. The UART transport,
+the fault fixtures in tests/fixtures/, and the live acceptance helpers are
+provided under this project's Apache-2.0 license.

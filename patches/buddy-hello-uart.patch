@@ -1,0 +1,161 @@
+diff --git a/examples/BOSCAMEFPGA/common/runtime/bare_runtime.c b/examples/BOSCAMEFPGA/common/runtime/bare_runtime.c
+index 2c098b74..0e3f89ca 100644
+--- a/examples/BOSCAMEFPGA/common/runtime/bare_runtime.c
++++ b/examples/BOSCAMEFPGA/common/runtime/bare_runtime.c
+@@ -49,6 +49,19 @@ __attribute__((weak)) void bare_runtime_before_main(void) {}
+ 
+ __attribute__((weak)) void bare_runtime_after_main(void) {}
+ 
++// Optional transport hooks. A scheduler can link strong definitions to report
++// the original main return value after all application diagnostics are printed.
++__attribute__((weak)) void bare_runtime_report_start(void) {}
++__attribute__((weak)) void bare_runtime_report_exit(int status) {
++  (void)status;
++}
++__attribute__((weak)) void
++bare_runtime_report_trap(uintptr_t cause, uintptr_t pc, uintptr_t value) {
++  (void)cause;
++  (void)pc;
++  (void)value;
++}
++
+ // Default machine-mode trap handler, called from crt_uart.S trap_entry.
+ //
+ // Calling convention (set up by the assembly stub):
+@@ -75,6 +88,8 @@ __attribute__((weak)) uintptr_t handle_trap(uintptr_t mcause, uintptr_t mepc,
+   print_uart_addr((uint64_t)mtval);
+   print_uart("\r\n");
+ 
++  bare_runtime_report_trap(mcause, mepc, mtval);
++
+   // Fatal path: there is no OS/scheduler to resume into after a trap dump.
+   // Spin in wfi so the hart stays idle and UART output is not flooded.
+   while (1)
+@@ -88,12 +103,15 @@ __attribute__((weak)) uintptr_t handle_trap(uintptr_t mcause, uintptr_t mepc,
+ void _init(void) {
+   init_uart(UART_FREQ_HZ, UART_BAUD);
+ 
++  bare_runtime_report_start();
++
+   bare_runtime_print_banner();
+ 
+   extern int main(void);
+   bare_runtime_before_main();
+-  main();
++  int status = main();
+   bare_runtime_after_main();
++  bare_runtime_report_exit(status);
+ 
+   while (1)
+     __asm__ volatile("wfi");
+diff --git a/examples/BOSCAMEFPGA/common/runtime/bare_runtime.h b/examples/BOSCAMEFPGA/common/runtime/bare_runtime.h
+index e215ab17..de87af45 100644
+--- a/examples/BOSCAMEFPGA/common/runtime/bare_runtime.h
++++ b/examples/BOSCAMEFPGA/common/runtime/bare_runtime.h
+@@ -25,6 +25,8 @@
+ #ifndef EXAMPLES_BOSCAMEFPGA_COMMON_RUNTIME_BARE_RUNTIME_H
+ #define EXAMPLES_BOSCAMEFPGA_COMMON_RUNTIME_BARE_RUNTIME_H
+ 
++#include <stdint.h>
++
+ // Called from _init() in bare_runtime.c after UART init, before
+ // before_main()/main(). Override to print a boot banner.
+ void bare_runtime_print_banner(void);
+@@ -37,4 +39,10 @@ void bare_runtime_before_main(void);
+ // the final wfi park. Override to log completion.
+ void bare_runtime_after_main(void);
+ 
++// Optional transport hooks, empty by default. Exit receives main's original
++// return value after after_main; a fatal trap has no application return value.
++void bare_runtime_report_start(void);
++void bare_runtime_report_exit(int status);
++void bare_runtime_report_trap(uintptr_t cause, uintptr_t pc, uintptr_t value);
++
+ #endif // EXAMPLES_BOSCAMEFPGA_COMMON_RUNTIME_BARE_RUNTIME_H
+diff --git a/examples/BOSCAMEFPGA/hello/README.md b/examples/BOSCAMEFPGA/hello/README.md
+index 2140e722..e06a3ae8 100644
+--- a/examples/BOSCAMEFPGA/hello/README.md
++++ b/examples/BOSCAMEFPGA/hello/README.md
+@@ -59,6 +59,24 @@ Success is `verify hello: PASS` on stdout (full text under
+ [Expected output](#expected-output)). Exit code 0 means load and capture
+ succeeded; confirm PASS on the UART stream.
+ 
++### Scheduler completion and build overrides
++
++The single-hart runtime offers weak `bare_runtime_report_start()`,
++`bare_runtime_report_exit(int)`, and `bare_runtime_report_trap(...)` hooks.
++A scheduler transport can provide strong definitions in an extra object.
++The runtime preserves `main()`'s return value and reports it after
++`bare_runtime_after_main()` finishes; a fatal trap uses the separate trap hook.
++The default hooks emit no additional output.
++
++The makefile accepts `BUILD_DIR`, `EXTRA_OBJECTS`, `EXTRA_CFLAGS`, and
++`EXTRA_LDFLAGS` for a separate instrumented build. `UART_FREQ_HZ` defaults
++to 14745600; changing it alone does not change the historical UART driver's
++fixed divisor. For a 5.5296 MHz board, also set `UART_C` to the configurable
++driver at `runtime/boscame/uart/uart.c`, using an absolute path or a path
++relative to this example. The scheduling repository's build helper sets both
++and links its UART completion transport. This keeps the numerical check
++bit for bit identical; a failed check now returns 1 instead of 0.
++
+ ## Files
+ 
+ ```text
+diff --git a/examples/BOSCAMEFPGA/hello/hello.c b/examples/BOSCAMEFPGA/hello/hello.c
+index 1a3854bf..d33950ce 100644
+--- a/examples/BOSCAMEFPGA/hello/hello.c
++++ b/examples/BOSCAMEFPGA/hello/hello.c
+@@ -49,7 +49,8 @@ void bare_runtime_before_main(void) { print_uart("rt: call main\r\n"); }
+ void bare_runtime_after_main(void) { print_uart("\r\n=== Hello Done ===\r\n"); }
+ 
+ // Application entry from _init(). print_uart_int emits 8 hex digits, so
+-// 42 prints as 0000002A. Return 0 is ignored; _init() never exits to a host.
++// 42 prints as 0000002A. Optional runtime report hooks publish the return
++// value.
+ int main(void) {
+   int answer = LHS + RHS;
+   print_uart("Hello, World!\r\n");
+@@ -66,5 +67,5 @@ int main(void) {
+     print_uart_int((uint32_t)answer);
+     print_uart("\r\n");
+   }
+-  return 0;
++  return answer == EXPECTED_ANSWER ? 0 : 1;
+ }
+diff --git a/examples/BOSCAMEFPGA/hello/makefile b/examples/BOSCAMEFPGA/hello/makefile
+index 0733f20d..ff528c5a 100644
+--- a/examples/BOSCAMEFPGA/hello/makefile
++++ b/examples/BOSCAMEFPGA/hello/makefile
+@@ -38,7 +38,9 @@ CRT_S           := $(RUNTIME_DIR)/crt_uart.S
+ UART_C          := $(UART_DIR)/uart.c
+ 
+ SRC             := hello.c
+-BUILD_DIR       := build
++BUILD_DIR       ?= build
++UART_FREQ_HZ    ?= 14745600
++EXTRA_OBJECTS   ?=
+ BIN             := $(BUILD_DIR)/hello.bin
+ OBJECTS         := $(addprefix $(BUILD_DIR)/,crt_uart.o hello.o bare_runtime.o uart.o)
+ 
+@@ -48,8 +50,8 @@ OBJECTS         := $(addprefix $(BUILD_DIR)/,crt_uart.o hello.o bare_runtime.o u
+ RISCV_CFLAGS    := -march=rv64gc -mabi=lp64d -mcmodel=medany -nostdlib \
+                    -fno-builtin -ffreestanding -fno-pie -O2 \
+                    -ffunction-sections -fdata-sections -MMD -MP \
+-                   -DUART_FREQ_HZ=14745600u -DUART_BAUD=115200u \
+-                   -I$(UART_DIR) -I$(RUNTIME_DIR)
++                   -DUART_FREQ_HZ=$(UART_FREQ_HZ)u -DUART_BAUD=115200u \
++                   -I$(UART_DIR) -I$(RUNTIME_DIR) $(EXTRA_CFLAGS)
+ 
+ all: $(BIN)
+ 
+@@ -66,8 +68,8 @@ $(BUILD_DIR)/uart.o: $(UART_C) $(MAKEFILE_LIST) | $(BUILD_DIR)
+ 	$(RISCV_CC) $(RISCV_CFLAGS) -c $< -o $@
+ 
+ # Link with hello_nr.ld. --gc-sections drops unused input sections.
+-$(BUILD_DIR)/hello.elf: $(OBJECTS) $(LD_SCRIPT) $(MAKEFILE_LIST)
+-	$(RISCV_LD) --script=$(LD_SCRIPT) --gc-sections -o $@ $(OBJECTS)
++$(BUILD_DIR)/hello.elf: $(OBJECTS) $(EXTRA_OBJECTS) $(LD_SCRIPT) $(MAKEFILE_LIST)
++	$(RISCV_LD) --script=$(LD_SCRIPT) --gc-sections $(EXTRA_LDFLAGS) -o $@ $(OBJECTS) $(EXTRA_OBJECTS)
+ 
+ # Raw binary for fpga_run.sh / UVHS; ELF headers stripped.
+ $(BIN): $(BUILD_DIR)/hello.elf $(MAKEFILE_LIST)
