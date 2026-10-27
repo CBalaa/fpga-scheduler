@@ -37,8 +37,11 @@ python3 prepare.py --project /path/to/local/hardware-project \
 load_db -db ./hw.dat -to {b1.f0}
 ~~~
 
-其中 b1.f0 是 FPGA4。FPGA0–7 映射 B0.F0–B1.F3。准备工具移除旧 allocate -board，
-重写唯一 load_db 目标；缺失、重复或 release 顺序错误会拒绝准备。
+其中 b1.f0 是 FPGA4。FPGA0–7 映射 B0.F0–B1.F3。准备工具移除旧 allocate 并重写
+唯一 load_db 目标；缺失、重复或 release 顺序错误会拒绝准备。
+UVHS 要求显式多用户分配时，准备工具加 `--explicit-allocation`，resident 配置使用
+`[resident] explicit_allocation = true`，会在 release 后、load_db 前插入目标端口的 allocate。
+默认 false 使用数据库目标分配；同一 UVHS 服务中的活动用户不能混用这两种分配方式。
 
 ## SSH 与配置
 

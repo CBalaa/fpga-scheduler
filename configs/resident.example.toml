@@ -16,6 +16,9 @@ hardware_project = "/path/to/existing-hardware-project"
 # Shared with every legacy/resident deployment that can operate these ports.
 # Administrator provisions directory access for the service account.
 lock_dir = "/path/to/shared/scheduler-locks"
+# Enable only when UVHS requires explicit allocate, rather than load_db -to.
+# Both allocation styles cannot be mixed among active users of one UVHS server.
+explicit_allocation = false
 # Physical clock output used by sys_clk; verify against the hardware project.
 # Matching 5.5296 MHz is reused without clock reconfiguration, even when
 # sibling FPGAs have active sessions. A mismatch waits while siblings are busy.
@@ -28,6 +31,12 @@ recovery_backoff = 10
 max_job_log_bytes = 1048576
 max_session_log_bytes = 4194304
 max_storage_bytes = 1073741824
+# Application-declared output must fit this physical DDR window.
+# Base is fixed by the NH profile. Span must be a multiple of 64, at most 256 MiB.
+output_ddr_base = 0x80000000
+output_ddr_bytes = 4194304
+# Aggregate exported bytes per task, at most 16 MiB / 16 named outputs.
+max_output_bytes = 16777216
 
 [[nodes]]
 id = "local"

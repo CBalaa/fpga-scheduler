@@ -60,6 +60,12 @@ def parser():
     jobs.add_argument('--offset', type=int, default=0)
     _command(commands, 'devices')
     _command(commands, 'health')
+    artifacts = _command(commands, 'artifacts', help='List saved DDR outputs')
+    artifacts.add_argument('id')
+    download = _command(commands, 'download', help='Download a saved DDR output with SHA256 verification')
+    download.add_argument('id')
+    download.add_argument('name')
+    download.add_argument('destination')
     return p
 
 
@@ -96,7 +102,12 @@ def main(argv=None):
             Application(config).serve()
             return 0
         client = Client(args.endpoint, token_file=args.token_file)
-        if args.command in ('run', 'submit'):
+        if args.command == 'artifacts':
+            result = dict(id=args.id, artifacts=client.artifacts(args.id))
+        elif args.command == 'download':
+            path = client.download_artifact(args.id, args.name, args.destination)
+            result = dict(id=args.id, name=args.name, path=str(path))
+        elif args.command in ('run', 'submit'):
             task = client.submit(args.image, ident=args.ident, timeout=args.timeout,
                                  idle_seconds=args.idle_seconds, queue_timeout=args.queue_timeout)
             print(f'[FPGA] Task {task.id} (Ctrl+C cancels)', file=sys.stderr, flush=True)

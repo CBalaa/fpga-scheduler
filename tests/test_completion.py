@@ -142,6 +142,13 @@ print('Total ERROR: '+os.environ['TEST_TOOL_ERROR'], flush=True)
         result = self.session(START + terminal(), readback=False)
         self.assertEqual(result['execution_status'], 'platform_error')
 
+    def test_legacy_runner_rejects_output_it_cannot_capture(self):
+        output = (b'@@FPGA_OUTPUT {"version":1,"name":"C","address":"0x80002000",'
+                  b'"nbytes":4,"dtype":"<i4","shape":[1,1]}\n')
+        result = self.session(START + output + terminal())
+        self.assertEqual(result['execution_status'], 'platform_error')
+        self.assertIn('bosc-resident', result['details']['error'])
+
     def test_cleanup_failure_overrides_application_success(self):
         result = self.session(START + terminal(), tool_error=True)
         self.assertEqual(result['execution_status'], 'platform_error')

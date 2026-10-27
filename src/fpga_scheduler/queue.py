@@ -4,6 +4,7 @@ import base64
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -239,6 +240,29 @@ class JobQueue:
             task.pop('result', None)
         return dict(id=ident, offset=offset, next_offset=offset + len(data),
                     data=base64.b64encode(data).decode('ascii'), done=done, task=task)
+
+    def artifacts(self, ident):
+        from .artifacts import validate_artifacts
+        task = self.get(ident)
+        if task['state'] in ACTIVE:
+            raise Conflict('Artifacts are available only after task completion and cleanup')
+        return dict(id=ident, artifacts=validate_artifacts((task.get('result') or {}).get('artifacts', [])))
+
+    def open_artifact(self, ident, name):
+        """Open while retention holds the queue lock; a download pins the inode."""
+        from .remote.runner import output_name
+        output_name(name)
+        with self.lock:
+            items = self.artifacts(ident)['artifacts']
+            item = next((item for item in items if item['name'] == name), None)
+            if item is None or not hasattr(self.backend, 'artifact_path'):
+                raise KeyError(name)
+            path = self.backend.artifact_path(ident, name)
+            handle = path.open('rb')
+            if os.fstat(handle.fileno()).st_size != item['nbytes']:
+                handle.close()
+                raise RuntimeError('Saved artifact length mismatch')
+            return handle, item
 
     def list(self, states=ACTIVE, limit=100, offset=0):
         if (not states or any(s not in STATES for s in states) or type(limit) is not int

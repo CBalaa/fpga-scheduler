@@ -26,11 +26,11 @@ def check_state_directory(state_dir):
 
 
 def validate_scenario(data):
-    fields = {'mode', 'label', 'duration', 'exit_code', 'output', 'fragment_bytes'}
+    fields = {'mode', 'label', 'duration', 'exit_code', 'output', 'fragment_bytes', 'outputs'}
     if not isinstance(data, dict) or set(data) - fields:
         raise ValueError('Invalid FPGA sim scenario fields')
     data = {**dict(mode='hello', label='hello', duration=.5, exit_code=0,
-                   output='SIMULATED FPGA hello: PASS\n', fragment_bytes=11), **data}
+                   output='SIMULATED FPGA hello: PASS\n', fragment_bytes=11, outputs=[]), **data}
     if data['mode'] not in MODES:
         raise ValueError('Unknown FPGA sim mode')
     for key in ('label', 'output'):
@@ -44,6 +44,24 @@ def validate_scenario(data):
         raise ValueError('FPGA sim exit_code must be a signed 32-bit integer')
     if type(data['fragment_bytes']) is not int or not 1 <= data['fragment_bytes'] <= 4096:
         raise ValueError('FPGA sim fragment_bytes must be within 1..4096')
+    from fpga_scheduler.remote.runner import Completion, output_declaration
+    outputs = data['outputs']
+    if not isinstance(outputs, list) or len(outputs) > 16:
+        raise ValueError('Invalid simulated outputs')
+    # Reuse real declarations; scenarios additionally contain small hex data.
+    for item in outputs:
+        if not isinstance(item, dict) or 'data' not in item or not isinstance(item['data'], str):
+            raise ValueError('Simulated output requires hexadecimal data')
+        declaration = output_declaration({k: v for k, v in item.items() if k != 'data'})
+        if len(bytes.fromhex(item['data'])) != declaration['nbytes']:
+            raise ValueError('Simulated output data length mismatch')
+        address = int(declaration['address'], 16)
+        if not 0x80000000 <= address < address + declaration['nbytes'] <= 0x80400000:
+            raise ValueError('Simulated output outside private 4 MiB DDR')
+    protocol = Completion()
+    protocol.feed(b'@@FPGA_START {"version":1}\n')
+    for item in outputs:
+        protocol.feed(('@@FPGA_OUTPUT ' + json.dumps({k: v for k, v in item.items() if k != 'data'}) + '\n').encode())
     return data
 
 

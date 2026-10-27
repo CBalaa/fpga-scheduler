@@ -77,3 +77,11 @@ runner 先独占并清空旧串口缓冲，再执行 make uv_runN。仅 UART 来
 output/result.json 在远端清理后原子写入，agent 汇总并通过 SSH 返回；uart_output
 单独返回 output/uart.raw.log 的串口文本，避免工具控制台插入应用行。客户端查询
 不会触发硬件重放。
+
+## DDR 输出声明
+
+在 START 和 RESULT 之间，应用可打印 `@@FPGA_OUTPUT` JSON 行，声明需要返回主机的
+DDR 物理地址、长度、dtype 和 shape。同一任务名称须唯一，字段与长度严格校验。
+Resident 在应用成功且确认复位后、释放槽位前读取并持久化数据；抓取失败使整个任务失败。
+超时、取消、trap、清理失败不导出。旧 SSH runner 不支持导出并会明确报错。
+格式、缓存写回责任和示例见 [DDR 输出说明](outputs.md)。

@@ -15,6 +15,8 @@ Authorization: Bearer <token>。没有用户身份字段；令牌持有者可操
 | POST /jobs | JSON id、sha256、timeout、idle_seconds、queue_timeout；须带 X-FPGA-Session；返回任务，202 |
 | GET /jobs/{id} | 单任务，200；不存在为 404 |
 | GET /jobs/{id}/output?offset=0&limit=65536 | 增量 UART 字节与任务快照，200；同样需要 token |
+| GET /jobs/{id}/artifacts | 终态任务的已保存 DDR 输出清单 `{id, artifacts}`；执行中为 409 |
+| GET /jobs/{id}/artifacts/{name} | 下载已保存输出，application/octet-stream；包含 Content-Length、X-Content-SHA256 |
 | GET /jobs | 返回 jobs、total、limit、offset；默认 queued,running,cancelling |
 | DELETE /jobs/{id} | queued → cancelled；running → cancelling，worker 收尾后终态；终态幂等返回 |
 | GET /devices | devices 列表与 errors 节点错误字典 |
@@ -65,6 +67,8 @@ queue_timeout 1–86400，均为整数秒，不接受布尔值或额外字段。
 时间为 Unix 秒；未开始/结束和未分配字段为 null。排队任务另有 position（从 1
 开始）、waiting_reason。存在执行响应时另有 result：output、exit_code、node、seconds、
 execution_status、app_exit_code、details、uart_output。
+Resident 的 result 还可含 artifacts：每项为 name、address、nbytes、dtype、shape、sha256。
+任务没有导出文件时该字段可省略，SDK 将其解释为空列表。
 
 exit_code 是执行器状态，0 对应 completed，取消为 130 / cancelled，其他非零对应 failed。app_exit_code
 是 bin 中 main 的原始有符号 32 位返回值，只在收到 exited 终态时存在；例如
@@ -110,7 +114,7 @@ client.close()  # 主动取消这个 Client 的全部未结束任务
 
 submit/job/cancel/wait 返回 Task dataclass；Task.result 为 Result dataclass 或 None。
 Result 有 output、node、exit_code、seconds、execution_status、app_exit_code、details、uart_output
-和 ok 属性。jobs 返回分页原始字典，
+和 artifacts、ok 属性。jobs 返回分页原始字典，
 devices/health 返回原始字典。Client 的 request_timeout 是单次 HTTP 超时，默认 30 秒；
 wait(timeout=...) 是轮询等待期限，超时抛 SchedulerError，不会取消已提交任务。
 SchedulerError.status 为 HTTP 状态或 None；提交/等待错误携带 task_id 便于恢复查询。
@@ -151,6 +155,12 @@ print(result.execution_status, result.app_exit_code, result.ok)
 offset 排除尚未解码的半个 UTF-8 字符，避免重连丢字。流不自动重连；服务停止后需等
 重新启动再查询原 ID。输出和续读受原有任务保留期限限制。
 
+`client.artifacts(id)` 返回输出清单；`client.download_artifact(id, "C", "C.bin")`
+下载至调用机器，核验长度和 SHA256 后原子替换目标文件，返回 `Path`。
+失败时保留原目标文件，可用同一任务 ID 重试下载，无需重新执行 bin。
+下载接口只读取已落盘的文件，不读取实时硬件；下载不续租、不影响端口占用。
+DDR 导出需升级 daemon 和 SDK，详见 [DDR 输出](outputs.md)。
+
 ## CLI
 
 ~~~text
@@ -167,6 +177,8 @@ fpga-scheduler [--endpoint URL] [--token-file PATH] [--json] <command>
 | jobs [--state queued,running] [--limit N] [--offset N] | 分页列表 |
 | cancel ID | 请求取消排队或运行任务；cancelling 尚未完成收尾 |
 | wait ID [--timeout N] [--poll-interval N] | 等待终态；不会取消 |
+| artifacts ID | 列出该任务已保存的 DDR 输出及 SHA256 |
+| download ID NAME DEST | 下载输出并校验长度、SHA256 |
 | devices / health | 设备与服务检查 |
 
 默认输出可读文本：daemon status 显示进程、API、活动任务数和端口表；jobs / devices 显示表格，

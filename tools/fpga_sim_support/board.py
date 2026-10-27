@@ -114,6 +114,8 @@ class ResidentSimulator(Resident):
     @staticmethod
     def _pack(data):
         start = b'@@FPGA_START {"version":1}\n'
+        start += b''.join(('@@FPGA_OUTPUT ' + json.dumps({k: v for k, v in item.items() if k != 'data'}) +
+                           '\n').encode() for item in data['outputs'])
         body = (data['label'] + '\n' + data['output']).encode()
         if not body.endswith(b'\n'):
             body += b'\n'
@@ -158,6 +160,17 @@ class ResidentSimulator(Resident):
                         os.close(master)
                         self.masters.pop(port, None)
                         continue
+                    if state['terminal'] and state['data']['outputs']:
+                        # Publish the computed DDR bytes only at completion.
+                        # Pre-execution readback remains a distinct file.
+                        memory = bytearray(4194304)
+                        for item in state['data']['outputs']:
+                            offset = int(item['address'], 16) - 0x80000000
+                            memory[offset:offset + item['nbytes']] = bytes.fromhex(item['data'])
+                        target = Path(image).parent / 'sim-ddr.bin'
+                        temporary = target.with_suffix('.tmp')
+                        temporary.write_bytes(memory)
+                        temporary.replace(target)
                     state['pending'], state['terminal'] = state['terminal'], b''
                 if state['pending']:
                     chunk = state['pending'][:state['data']['fragment_bytes']]

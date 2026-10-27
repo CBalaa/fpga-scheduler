@@ -106,6 +106,20 @@ class ResidentTests(unittest.TestCase):
         ports = self.backend.probe('local')
         self.assertTrue(all(p['available'] for p in ports), ports)
 
+    def test_database_allocation_mode_does_not_allocate(self):
+        with patch.dict(os.environ, {'FAKE_REJECT_ALLOCATION': '1'}):
+            self.ready()
+            result = self.run_task(self.task(1))
+        self.assertEqual(result['exit_code'], 0, result)
+
+    def test_explicit_allocation_mode_allocates_after_release(self):
+        self.backend.explicit_allocation = True
+        self.backend.bootstraps = {p: self.backend._bootstrap(p) for p in self.backend.node.ports}
+        with patch.dict(os.environ, {'FAKE_REQUIRE_ALLOCATION': '1'}):
+            self.ready()
+            result = self.run_task(self.task(1))
+        self.assertEqual(result['exit_code'], 0, result)
+
     def test_same_session_a_b_a_and_stale_uart_boundary(self):
         self.ready()
         epoch = self.backend.sessions[4].epoch
@@ -654,9 +668,12 @@ class RecoveryAndQuotaTests(unittest.TestCase):
             self.assertEqual(load(path).nodes[0].ports, (4,5))
             path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=0'))
             self.assertEqual(load(path).resident['shared_clock_index'], 0)
+            path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=true'))
+            self.assertTrue(load(path).resident['explicit_allocation'])
             for bad in (base + 'ssh_host="remote"\n', base.replace('ports=[4,5]', 'ports=[4,4]'),
                         base.replace('hardware_project="project"', 'profile="dma"\nhardware_project="project"'),
                         base.replace('lock_dir="locks"', 'lock_dir="locks"\nrecovery_attempts=1.5'),
+                        base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=1'),
                         *(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=' + value)
                           for value in ('-1', '24', 'true', '6.0'))):
                 path.write_text(bad)

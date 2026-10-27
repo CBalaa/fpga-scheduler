@@ -6,7 +6,16 @@ set reset_value 1
 set released 0
 set sim_mode hello
 set sim_duration 0
-proc load_db {args} {}
+set allocated ""
+proc allocate {args} {set ::allocated [lindex $args 1]}
+proc load_db {args} {
+    if {[lindex $args 0] eq "-release"} {set ::allocated ""; return}
+    set target [lindex $args [expr {[lsearch $args -to] + 1}]]
+    if {$target eq "" || ($::allocated ne "" && $::allocated ne $target) ||
+        ([info exists ::env(FAKE_REQUIRE_ALLOCATION)] && $::allocated ne $target)} {
+        error "allocate target after release before loading DB"
+    }
+}
 proc set_option {args} {}
 proc config {args} {}
 proc initialize {} {}
@@ -35,15 +44,24 @@ proc reset {args} {
     } else {file delete -force [file join $work running]}
 }
 proc writemem {args} {
-    global loaded sim_mode sim_duration
+    global loaded sim_mode sim_duration released
+    set released 0
     set loaded [lindex $args [expr {[lsearch $args -file] + 1}]]
     source [file join [file dirname $loaded] sim.tcl]
     if {$sim_mode eq "command-error"} {error "simulated DDR write error"}
     if {$sim_mode eq "command-timeout"} {after [expr {int($sim_duration * 1000)}]}
 }
 proc readmem {args} {
-    global loaded sim_mode
+    global loaded sim_mode released
     set target [lindex $args [expr {[lsearch $args -file] + 1}]]
+    if {$released} {
+        set rtl [lindex $args [expr {[lsearch $args -rtl] + 1}]]
+        if {![regexp {\[(\d+):0\]} $rtl unused last]} {error "invalid memory range"}
+        set memory [file join [file dirname $loaded] sim-ddr.bin]
+        set f [open $memory rb]; set data [read $f [expr {($last+1)*64}]]; close $f
+        set f [open $target wb]; puts -nonewline $f $data; close $f
+        return
+    }
     if {$sim_mode eq "readback-error"} {
         set f [open $target w]; puts $f corrupt; close $f
     } else {file copy -force $loaded $target}

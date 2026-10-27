@@ -14,7 +14,7 @@ import termios
 import time
 import uuid
 
-from .runner import Completion, ProtocolError, platform_error
+from .runner import Completion, ProtocolError, platform_error, MAX_OUTPUT_BYTES
 from ..models import Cancellation, CancelledError
 
 
@@ -119,13 +119,16 @@ class BoundedLog:
 class Session:
     def __init__(self, node, number, directory, port_lock, *, startup_timeout=300,
                  command_timeout=60, uart_quiet_seconds=.2, max_job_log_bytes=1048576,
-                 max_session_log_bytes=4194304, **_):
+                 max_session_log_bytes=4194304, output_ddr_base=0x80000000,
+                 output_ddr_bytes=4194304, max_output_bytes=MAX_OUTPUT_BYTES, **_):
         self.node, self.number = node, number
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.port_lock = port_lock
         self.startup_timeout, self.command_timeout = startup_timeout, command_timeout
         self.quiet, self.max_job_log = uart_quiet_seconds, max_job_log_bytes
+        self.output_base, self.output_span = output_ddr_base, output_ddr_bytes
+        self.max_output = max_output_bytes
         self.epoch, self.seq = uuid.uuid4().hex, 0
         self.process = None
         self.master = self.serial = None
@@ -248,6 +251,58 @@ class Session:
                 return discarded
         raise ProtocolError('UART did not become quiet while reset was asserted')
 
+    def capture_outputs(self, outputs, directory):
+        """Read one bounded DDR prefix, then extract exact byte ranges.
+
+        Prefix reads deliberately use the same vendor memory ordering as the
+        established image readback. Arbitrary nonzero RTL slices are not assumed.
+        Caller owns the slot and has confirmed reset and application completion.
+        """
+        if not outputs:
+            return []
+        if sum(item['nbytes'] for item in outputs) > self.max_output:
+            raise ValueError('Output total exceeds resident max_output_bytes')
+        end = self.output_base
+        for item in outputs:
+            address = int(item['address'], 16)
+            if not self.output_base <= address < address + item['nbytes'] <= self.output_base + self.output_span:
+                raise ValueError('Output lies outside the configured physical DDR window')
+            end = max(end, address + item['nbytes'])
+        size = (end - self.output_base + 63) // 64 * 64
+        directory = Path(directory) / 'artifacts'
+        directory.mkdir(exist_ok=True)
+        snapshot = directory / '.snapshot.tmp'
+        written, manifest = [], []
+        try:
+            memory = f'nanhu_xilinx.i_ddr[{size // 64 - 1}:0]'
+            self.command('readmem -rtl ' + tcl(memory) + ' -file ' + tcl(snapshot) + ' -file_type bin')
+            if snapshot.stat().st_size != size:
+                raise RuntimeError('Output DDR snapshot length mismatch')
+            with snapshot.open('rb') as source:
+                for item in outputs:
+                    source.seek(int(item['address'], 16) - self.output_base)
+                    data = source.read(item['nbytes'])
+                    if len(data) != item['nbytes']:
+                        raise RuntimeError('Output DDR data is truncated')
+                    path = directory / (item['name'] + '.bin')
+                    temporary = directory / (item['name'] + '.tmp')
+                    written.extend((temporary, path))
+                    with temporary.open('wb') as handle:
+                        handle.write(data)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    temporary.replace(path)
+                    manifest.append({**{k: v for k, v in item.items() if k != 'version'},
+                                     'sha256': hashlib.sha256(data).hexdigest()})
+            atomic_json(directory / 'manifest.json', manifest)
+            return manifest
+        except BaseException:
+            for path in written:
+                path.unlink(missing_ok=True)
+            raise
+        finally:
+            snapshot.unlink(missing_ok=True)
+
     def execute(self, payload, image, directory, *, cancellation=None):
         cancellation = cancellation or Cancellation()
         directory = Path(directory)
@@ -352,11 +407,24 @@ class Session:
                     uart.extend(data)
                     protocol.feed(data)
                 self.boundary()
+                protocol.finish()
                 reset_ok = True
             except (OSError, RuntimeError, ValueError) as error:
                 result['details'].setdefault('interrupted_status', result['execution_status'])
                 result.update(execution_status='platform_error', exit_code=1)
                 result['details']['cleanup_error'] = str(error)
+            if protocol.outputs:
+                result['details']['outputs_declared'] = protocol.outputs
+                if reset_ok and result['execution_status'] == 'exited' and result['app_exit_code'] == 0:
+                    try:
+                        result['artifacts'] = self.capture_outputs(protocol.outputs, directory)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        result.update(execution_status='platform_error', exit_code=1)
+                        result['details']['artifact_error'] = str(error)
+                        if isinstance(error, CommandTimeout):
+                            result['details']['interrupted_status'] = 'timeout'
+                else:
+                    result['details']['artifacts_skipped'] = 'Application completion or hardware cleanup was not successful'
             log.close()
             result['details'].update(reset_confirmed=reset_ok, application_started=protocol.started)
             result['uart_output'] = result['output'] = uart.decode(errors='replace')

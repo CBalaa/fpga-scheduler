@@ -85,6 +85,22 @@ def make_server(address, queue, images, token):
                 raise ValueError('Incomplete request body')
             return body
 
+        def artifact(self, ident, name):
+            handle, item = queue.open_artifact(ident, name)
+            with handle:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/octet-stream')
+                self.send_header('Content-Length', str(item['nbytes']))
+                self.send_header('Content-Disposition', f'attachment; filename="{name}.bin"')
+                self.send_header('X-Content-SHA256', item['sha256'])
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                try:
+                    while chunk := handle.read(65536):
+                        self.wfile.write(chunk)
+                except (OSError, TimeoutError):
+                    pass  # Saved bytes and hardware lifetime do not depend on this reader.
+
         def handle_api(self):
             supplied = self.headers.get('Authorization', '')
             if not hmac.compare_digest(supplied.encode(), ('Bearer ' + token).encode()):
@@ -95,6 +111,7 @@ def make_server(address, queue, images, token):
                 route = path.path
                 match = re.fullmatch(r'/jobs/([0-9a-f]{32})(/image|/output)?', route)
                 session = re.fullmatch(r'/sessions/([0-9a-f]{32})(/heartbeat)?', route)
+                artifact = re.fullmatch(r'/jobs/([0-9a-f]{32})/artifacts(?:/([A-Za-z][A-Za-z0-9_-]{0,63}))?', route)
                 if self.command == 'GET' and route == '/health':
                     alive = queue.dispatcher is not None and queue.dispatcher.is_alive()
                     ok = alive and not queue.stopping.is_set()
@@ -115,6 +132,13 @@ def make_server(address, queue, images, token):
                         raise ValueError('Invalid query parameters')
                     states = tuple(query['state'][0].split(',')) if 'state' in query else ACTIVE
                     self.reply(200, queue.list(states, int(query.get('limit', ['100'])[0]), int(query.get('offset', ['0'])[0])))
+                elif self.command == 'GET' and artifact:
+                    if path.query:
+                        raise ValueError('Artifact routes do not accept query parameters')
+                    if artifact[2] is None:
+                        self.reply(200, queue.artifacts(artifact[1]))
+                    else:
+                        self.artifact(artifact[1], artifact[2])
                 elif self.command == 'GET' and match and match[2] == '/output':
                     query = parse_qs(path.query, keep_blank_values=True)
                     if set(query) - {'offset', 'limit'} or any(len(v) != 1 for v in query.values()):

@@ -192,7 +192,8 @@ def task(data, *, include_output=True, color=False):
                       f'Duration: {_duration(data)}'])
         details = result.get('details') or {}
         for key, label in (('error', 'Execution error'), ('cancel_reason', 'Cancel reason'),
-                           ('interrupted_status', 'Interrupted status'), ('cleanup_error', 'Cleanup error')):
+                           ('interrupted_status', 'Interrupted status'), ('cleanup_error', 'Cleanup error'),
+                           ('artifact_error', 'Output collection error'), ('artifacts_skipped', 'Outputs skipped')):
             if details.get(key):
                 lines.append(paint(f'{label}: {_text(details[key])}',
                                    'yellow' if key in ('cancel_reason', 'interrupted_status') else 'red', color=color))
@@ -208,10 +209,21 @@ def task(data, *, include_output=True, color=False):
             output = result.get('output', '')
         if include_output and output:
             lines.extend(['', paint('UART:', 'heading', color=color), output.rstrip('\n')])
+        for item in result.get('artifacts', []):
+            lines.append(f'Output: {item["name"]} | {item["nbytes"]} bytes | {item["dtype"]} {item["shape"]}')
     return '\n'.join(lines)
 
 
 def render(command, data, *, action=None, color=False):
+    if command == 'download':
+        return f'Saved {data["name"]}: {data["path"]} (SHA256 verified)'
+    if command == 'artifacts':
+        items = data['artifacts']
+        if not items:
+            return 'No saved DDR outputs.'
+        return _table(['NAME', 'BYTES', 'DTYPE', 'SHAPE', 'ADDRESS', 'SHA256'],
+                      [[p['name'], p['nbytes'], p['dtype'], p['shape'], p['address'], p['sha256']] for p in items],
+                      color=color)
     if command == 'daemon':
         return daemon(action, data, color=color)
     if command in ('jobs', 'devices', 'health'):

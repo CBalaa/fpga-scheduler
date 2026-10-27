@@ -10,9 +10,9 @@ import re
 import shutil
 
 
-def bind_port(source, number):
-    # allocate followed by load_db -release loses the selected port. Bind the
-    # database itself, otherwise UVHS can silently download onto B0.F0.
+def bind_port(source, number, *, explicit_allocation=False):
+    # Release clears an earlier allocation. Allocate afterwards for multi-user
+    # UVHS, and bind the database too so downloads cannot fall back to B0.F0.
     source = re.sub(r'^\s*allocate -board[^\n]*\n', '', source, flags=re.M)
     source, count = re.subn(
         r'^load_db -db \./hw\.dat[^\n]*$',
@@ -22,6 +22,8 @@ def bind_port(source, number):
     loads = list(re.finditer(r'^\s*load_db\s+-db\b', source, re.M))
     if count != 1 or len(loads) != 1 or len(releases) != 1 or releases[0].start() >= loads[0].start():
         raise ValueError(f'FPGA{number}: expected exactly one hardware database load')
+    if explicit_allocation:
+        source = source[:loads[0].start()] + ('allocate -board {b%d.f%d}\n' % divmod(number, 4)) + source[loads[0].start():]
     return source
 
 
@@ -31,12 +33,15 @@ def main():
     parser.add_argument('--run-script', type=Path, help='Legacy runner; omit for strict UART v1 completion')
     parser.add_argument('--scheduler', type=Path, required=True)
     parser.add_argument('--ports', default='4,5,6,7,0,1,2,3')
+    parser.add_argument('--explicit-allocation', action='store_true',
+                        help='Allocate after release when the UVHS server requires explicit multi-user allocation')
     parser.add_argument('--destination', type=Path, default=Path.home() / 'fpga-platform')
     args = parser.parse_args()
     ports = tuple(int(p) for p in args.ports.split(','))
     if not ports or len(set(ports)) != len(ports) or any(p not in range(8) for p in ports):
         raise ValueError('ports must be distinct numbers in 0..7')
-    scripts = {n: bind_port((args.project / 'user_script/hw_run' / f'hw_run{n}.tcl').read_text(), n)
+    scripts = {n: bind_port((args.project / 'user_script/hw_run' / f'hw_run{n}.tcl').read_text(), n,
+                           explicit_allocation=args.explicit_allocation)
                for n in ports}
     for path in (args.project / 'Makefile', args.project / 'hw.dat', args.scheduler):
         if not path.exists(): raise ValueError(f'missing runtime input: {path}')

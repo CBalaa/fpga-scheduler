@@ -226,5 +226,7 @@ fpga-scheduler daemon stop &&
 
 更多选项见 [配置示例](configs/resident.example.toml)、[运维说明](docs/operations.md) 和 [API 文档](docs/api.md)。来源见 [NOTICE](NOTICE)，许可证见 [Apache-2.0](LICENSE)。
 
+需要把 FPGA 的计算结果写入 DDR 并下载到主机验证时，参见 [DDR 输出示例](examples/ddr_output/README.md)。
+
 
 本地开发的离线 FPGA 模拟测试见 [开发工具说明](docs/simulator.md)，无需 FPGA 服务器或硬件。

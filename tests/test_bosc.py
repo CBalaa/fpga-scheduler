@@ -188,6 +188,13 @@ sys.exit(status)
             self.assertEqual((scripts / 'hw_run4.tcl').read_text(), original)
             self.assertTrue((destination / 'hw.dat').is_symlink())
             self.assertIn('-to {b1.f0}', (destination / 'user_script/hw_run/hw_run4.tcl').read_text())
+            rewritten = (destination / 'user_script/hw_run/hw_run4.tcl').read_text()
+            self.assertNotIn('allocate -board', rewritten)
+            self.assertEqual(prepare.bind_port(rewritten, 4), rewritten)
+            explicit = prepare.bind_port(rewritten, 4, explicit_allocation=True)
+            self.assertLess(explicit.index('load_db -release'), explicit.index('allocate -board {b1.f0}'))
+            self.assertLess(explicit.index('allocate -board {b1.f0}'), explicit.index('load_db -db'))
+            self.assertEqual(prepare.bind_port(explicit, 4, explicit_allocation=True), explicit)
             self.assertTrue(os.access(destination / 'run.sh', os.X_OK))
             for invalid in ('query -fpgas -all', 'load_db -db ./hw.dat\nload_db -db ./hw.dat\n',
                             'load_db -db ./hw.dat\nload_db -release\n'):

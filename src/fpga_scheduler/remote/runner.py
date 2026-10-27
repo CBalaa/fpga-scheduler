@@ -6,25 +6,61 @@ output/result.json is the machine-readable result, written after session cleanup
 """
 import argparse
 import errno
-import fcntl
 import hashlib
 import json
 import os
 from pathlib import Path
-import pty
 import re
 import select
 import signal
 import subprocess
-import termios
 import time
 
 START = b'@@FPGA_START '
 RESULT = b'@@FPGA_RESULT '
+OUTPUT = b'@@FPGA_OUTPUT '
+MAX_OUTPUTS = 16
+MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+OUTPUT_DTYPES = {'|i1': 1, '|u1': 1, '<i2': 2, '<u2': 2, '<i4': 4,
+                 '<u4': 4, '<i8': 8, '<u8': 8, '<f4': 4, '<f8': 8}
 
 
 class ProtocolError(ValueError):
     pass
+
+
+def output_name(name):
+    if not isinstance(name, str) or re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,63}', name) is None:
+        raise ValueError('Output name must match [A-Za-z][A-Za-z0-9_-]{0,63}')
+    return name
+
+
+def output_declaration(value):
+    fields = {'version', 'name', 'address', 'nbytes', 'dtype', 'shape'}
+    if not isinstance(value, dict) or set(value) != fields or type(value['version']) is not int or value['version'] != 1:
+        raise ProtocolError('Invalid output declaration fields/version')
+    try:
+        output_name(value['name'])
+    except ValueError as error:
+        raise ProtocolError(str(error)) from None
+    address, size, shape = value['address'], value['nbytes'], value['shape']
+    if not isinstance(address, str) or re.fullmatch(r'0x[0-9a-fA-F]{1,16}', address) is None:
+        raise ProtocolError('Invalid output physical address')
+    if type(size) is not int or not 1 <= size <= MAX_OUTPUT_BYTES or int(address, 16) + size > 2 ** 64:
+        raise ProtocolError('Invalid output byte count/range')
+    dtype = value['dtype']
+    if not isinstance(dtype, str) or dtype not in OUTPUT_DTYPES:
+        raise ProtocolError('Unsupported output dtype')
+    if not isinstance(shape, list) or not 1 <= len(shape) <= 8:
+        raise ProtocolError('Invalid output shape')
+    expected = OUTPUT_DTYPES[dtype]
+    for dimension in shape:
+        if type(dimension) is not int or not 1 <= dimension <= MAX_OUTPUT_BYTES:
+            raise ProtocolError('Invalid output dimension')
+        expected *= dimension
+    if expected != size:
+        raise ProtocolError('Output shape/dtype does not match byte count')
+    return dict(value, shape=list(shape))
 
 
 class Completion:
@@ -33,6 +69,7 @@ class Completion:
         self.pending = b''
         self.started = False
         self.result = None
+        self.outputs = []
 
     def feed(self, data):
         self.pending += data
@@ -48,6 +85,16 @@ class Completion:
                 if value != {'version': 1} or type(value['version']) is not int:
                     raise ProtocolError('Unsupported start record')
                 self.started = True
+            elif line.startswith(OUTPUT):
+                if not self.started or self.result is not None:
+                    raise ProtocolError('Output declaration must be between START and RESULT')
+                value = output_declaration(self.decode(line[len(OUTPUT):]))
+                if any(item['name'] == value['name'] for item in self.outputs):
+                    raise ProtocolError('Repeated output name')
+                if (len(self.outputs) >= MAX_OUTPUTS or
+                        sum(item['nbytes'] for item in self.outputs) + value['nbytes'] > MAX_OUTPUT_BYTES):
+                    raise ProtocolError('Output count/total byte limit exceeded')
+                self.outputs.append(value)
             elif line.startswith(RESULT):
                 if not self.started:
                     raise ProtocolError('Terminal record without application start')
@@ -73,6 +120,10 @@ class Completion:
                 self.result = value
         if len(self.pending) > 4096:
             raise ProtocolError('UART line exceeds 4096 bytes')
+
+    def finish(self):
+        if self.pending.startswith((START, RESULT, OUTPUT)):
+            raise ProtocolError('Incomplete UART protocol record')
 
     @staticmethod
     def decode(data):
@@ -112,6 +163,12 @@ def emit(data):
 
 
 def run(args):
+    # Completion/declaration validation is also imported by the portable SDK.
+    # Only the hardware runner needs POSIX UART and terminal support.
+    import fcntl
+    import pty
+    import termios
+
     directory = Path(args.workdir).resolve()
     output = Path(os.environ.get('UV_RUN_OUT_ROOT', directory / 'output'))
     output.mkdir(parents=True, exist_ok=True)
@@ -215,6 +272,9 @@ def run(args):
                     raise ProtocolError('UVHS exited before a complete application session')
             if protocol.result is not None:
                 result['details']['application'] = protocol.result
+            if protocol.outputs:
+                result['details']['outputs_declared'] = protocol.outputs
+                raise RuntimeError('DDR output export requires the bosc-resident backend')
             if result['execution_status'] in ('exited', 'trap'):
                 # The project captures readback before releasing CPU reset.
                 image = Path(args.test.split('=', 1)[1])

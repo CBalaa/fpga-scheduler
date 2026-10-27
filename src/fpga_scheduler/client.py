@@ -10,6 +10,7 @@ import math
 import os
 from pathlib import Path
 import threading
+import tempfile
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlsplit
@@ -17,6 +18,7 @@ from urllib.request import Request, urlopen
 import uuid
 
 from .models import ACTIVE, MAX_IMAGE, task_id, validate
+from .artifacts import validate_artifacts, output_name
 
 
 _clients = set()
@@ -65,6 +67,7 @@ class Result:
     app_exit_code: int | None = None
     details: dict = field(default_factory=dict)
     uart_output: str | None = None
+    artifacts: list[dict] = field(default_factory=list)
 
     @property
     def ok(self):
@@ -336,6 +339,62 @@ class Client:
 
     def job(self, ident):
         return Task.from_dict(self._request('/jobs/' + task_id(ident)))
+
+    def artifacts(self, ident):
+        """List immutable output metadata; no FPGA access or new submission."""
+        value = self._request('/jobs/' + task_id(ident) + '/artifacts')
+        try:
+            if value['id'] != ident:
+                raise ValueError('Artifact task ID mismatch')
+            return validate_artifacts(value['artifacts'])
+        except (ValueError, KeyError, TypeError):
+            raise SchedulerError('Invalid artifact manifest', ident=ident) from None
+
+    def download_artifact(self, ident, name, destination):
+        """Download to an atomic file, verifying length and SHA256.
+
+        Failed downloads leave an existing destination untouched. Retrying uses
+        saved server bytes and never reruns a program or reads live hardware.
+        """
+        task_id(ident)
+        output_name(name)
+        items = self.artifacts(ident)
+        item = next((item for item in items if item['name'] == name), None)
+        if item is None:
+            raise SchedulerError('Artifact not found: ' + name, status=404, ident=ident)
+        destination = Path(destination)
+        request = Request(self.endpoint + '/jobs/' + ident + '/artifacts/' + name,
+                          headers={'Authorization': 'Bearer ' + self.token})
+        temporary = None
+        try:
+            with urlopen(request, timeout=self.request_timeout) as response:
+                if (response.headers.get('Content-Length') != str(item['nbytes']) or
+                        response.headers.get('X-Content-SHA256') != item['sha256']):
+                    raise SchedulerError('Artifact response metadata mismatch', ident=ident)
+                digest, size = hashlib.sha256(), 0
+                with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as handle:
+                    temporary = Path(handle.name)
+                    while chunk := response.read(min(65536, item['nbytes'] - size + 1)):
+                        size += len(chunk)
+                        if size > item['nbytes']:
+                            raise SchedulerError('Artifact response exceeds declared length', ident=ident)
+                        digest.update(chunk)
+                        handle.write(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if size != item['nbytes'] or digest.hexdigest() != item['sha256']:
+                    raise SchedulerError('Artifact length or SHA256 mismatch', ident=ident)
+            temporary.replace(destination)
+            return destination
+        except HTTPError as error:
+            raise SchedulerError(f'Artifact download failed (HTTP {error.code}); retry the same task ID',
+                                 status=error.code, ident=ident) from None
+        except (URLError, TimeoutError, OSError, ValueError, HTTPException) as error:
+            raise SchedulerError(f'Artifact download failed ({type(error).__name__}); retry the same task ID',
+                                 ident=ident) from None
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
     def jobs(self, states=ACTIVE, *, limit=100, offset=0):
         return self._request('/jobs?' + urlencode(dict(state=','.join(states), limit=limit, offset=offset)))

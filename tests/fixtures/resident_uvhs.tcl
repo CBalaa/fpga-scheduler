@@ -2,7 +2,19 @@
 set work [lindex $argv [expr {[lsearch $argv -workdir] + 1}]]
 set loaded ""
 set reset_value 1
-proc load_db {args} {}
+set allocated ""
+proc allocate {args} {
+    if {[info exists ::env(FAKE_REJECT_ALLOCATION)]} {error "explicit allocation incompatible with current server mode"}
+    set ::allocated [lindex $args 1]
+}
+proc load_db {args} {
+    if {[lindex $args 0] eq "-release"} {set ::allocated ""; return}
+    set target [lindex $args [expr {[lsearch $args -to] + 1}]]
+    if {$target eq "" || ($::allocated ne "" && $::allocated ne $target) ||
+        ([info exists ::env(FAKE_REQUIRE_ALLOCATION)] && $::allocated ne $target)} {
+        error "allocate target after release before loading DB"
+    }
+}
 proc set_option {args} {}
 proc config {args} {
     global work

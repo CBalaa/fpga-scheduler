@@ -17,6 +17,7 @@ from ..remote.prepare import bind_port
 from ..remote.runner import platform_error
 from ..remote.runtime import parse_fpgas
 from ..remote.uvhs_session import Session, atomic_json, fingerprint, retire_record
+from ..artifacts import validate_artifacts
 
 
 NH_CLOCK_HZ = 5529600
@@ -26,7 +27,7 @@ class Resident:
     supports_cancellation = True
     def __init__(self, nodes, state_dir, *, hardware_project, lock_dir,
                  recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824,
-                 shared_clock_index=6, **options):
+                 shared_clock_index=6, explicit_allocation=False, **options):
         if len(nodes) != 1:
             raise ValueError('Resident backend manages exactly one local node')
         self.nodes, self.node = nodes, nodes[0]
@@ -38,6 +39,9 @@ class Resident:
         if type(shared_clock_index) is not int or not 0 <= shared_clock_index <= 23:
             raise ValueError('shared_clock_index must be an integer in 0..23')
         self.shared_clock_index = shared_clock_index
+        if type(explicit_allocation) is not bool:
+            raise ValueError('explicit_allocation must be a boolean')
+        self.explicit_allocation = explicit_allocation
         self.recovery_attempts, self.backoff = recovery_attempts, recovery_backoff
         self.max_storage = max_storage_bytes
         self.guard = threading.RLock()
@@ -61,7 +65,8 @@ class Resident:
                 retire_record(path)
 
     def _bootstrap(self, number):
-        source = bind_port((self.project / 'user_script/hw_run' / f'hw_run{number}.tcl').read_text(), number)
+        source = bind_port((self.project / 'user_script/hw_run' / f'hw_run{number}.tcl').read_text(), number,
+                           explicit_allocation=self.explicit_allocation)
         active = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#'))
         anchor = 'source ./user_script/hw_run/write_image.tcl'
         if active.count(anchor) != 1:
@@ -276,7 +281,9 @@ class Resident:
         if node != self.node.id:
             raise ValueError('Unknown node')
         reserve = (max(1048576, (image.stat().st_size + 1048575) // 1048576 * 1048576) * 2 +
-                   self.options.get('max_job_log_bytes', 1048576) * 2)
+                   self.options.get('max_job_log_bytes', 1048576) * 2 +
+                   self.options.get('output_ddr_bytes', 4194304) +
+                   self.options.get('max_output_bytes', 16777216))
         if hashlib.sha256(image.read_bytes()).hexdigest() != payload['sha256']:
             raise ValueError('Input checksum mismatch')
         with self.guard:
@@ -349,9 +356,19 @@ class Resident:
                     result['node'] != job['node'] or result['details']['fpga'] != job['fpga'] or
                     type(result['exit_code']) is not int or not isinstance(result['output'], str)):
                 return None
+            for item in validate_artifacts(result.get('artifacts', [])):
+                artifact = path.parent / 'artifacts' / (item['name'] + '.bin')
+                if (artifact.stat().st_size != item['nbytes'] or
+                        hashlib.sha256(artifact.read_bytes()).hexdigest() != item['sha256']):
+                    return None
             return result
-        except (KeyError, ValueError, TypeError):
+        except (KeyError, ValueError, TypeError, OSError):
             return None
+
+    def artifact_path(self, ident, name):
+        from ..models import task_id
+        from ..remote.runner import output_name
+        return self.root / 'jobs' / task_id(ident) / 'artifacts' / (output_name(name) + '.bin')
 
     def cleanup(self, before):
         # Queue retention runs first; image directories are the authoritative
