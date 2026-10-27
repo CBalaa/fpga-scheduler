@@ -9,7 +9,7 @@ import secrets
 import sys
 
 from .client import Client, SchedulerError
-from .display import color_enabled, paint, render
+from .display import capacity_details, color_enabled, paint, render
 
 
 def _command(parent, *args, **kwargs):
@@ -113,6 +113,13 @@ def main(argv=None):
             print(f'[FPGA] Task {task.id} (Ctrl+C cancels)', file=sys.stderr, flush=True)
             last_chunk = ''
             with client.stream_output(task.id, timeout=args.queue_timeout + args.timeout + 300) as stream:
+                def update(current):
+                    if current.state == 'queued' and current.waiting_reason:
+                        print(paint(f'[FPGA] Queued #{current.position}: {current.waiting_reason}',
+                                    'yellow', color=error_color), file=sys.stderr, flush=True)
+                        for line in capacity_details(current.waiting_details):
+                            print('[FPGA] ' + line, file=sys.stderr, flush=True)
+                stream.on_update = update
                 for chunk in stream:
                     if not args.json:
                         print(chunk, end='', flush=True)
@@ -139,7 +146,12 @@ def main(argv=None):
         data = {'error': str(error)}
         if isinstance(error, SchedulerError) and error.task_id:
             data['id'] = error.task_id
+        if isinstance(error, SchedulerError) and error.details:
+            data['error_details'] = error.details
         print(json.dumps(data, ensure_ascii=False) if args.json else paint(str(error), 'red', color=error_color), file=sys.stderr)
+        if not args.json:
+            for line in capacity_details(data.get('error_details')):
+                print(line, file=sys.stderr)
         return 1
     except KeyboardInterrupt:
         print(paint('Interrupted; cancelling this client\'s unfinished tasks', 'yellow', color=error_color), file=sys.stderr)

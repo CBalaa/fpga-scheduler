@@ -16,6 +16,7 @@ from urllib.error import HTTPError
 from fpga_scheduler.client import Client, SchedulerError
 from fpga_scheduler.config import Config, Node
 from fpga_scheduler.service import Application, StateLock, read_token
+from fpga_scheduler.storage import StorageQuotaExceeded
 
 PROJECT = Path(__file__).resolve().parents[1]
 TOKEN = 'a' * 48
@@ -130,6 +131,68 @@ class HTTPTests(unittest.TestCase):
         queried = json.loads(self.cli('job', task.id).stdout)
         self.assertEqual(queried['result']['app_exit_code'], 7)
         self.assertEqual(queried['result']['uart_output'], done.result.uart_output)
+
+    def test_input_quota_is_structured_through_http_sdk_and_cli(self):
+        self.app.queue.images.max_bytes = 1
+        with self.assertRaises(SchedulerError) as caught:
+            self.client.submit(self.image)
+        error = caught.exception
+        self.assertEqual(error.status, 503)
+        self.assertEqual(error.error_code, 'input_storage_quota_exceeded')
+        self.assertFalse(error.details['hardware_started'])
+        self.assertEqual(error.details['limit_bytes'], 1)
+        self.assertEqual(error.details['requested_bytes'], self.image.stat().st_size)
+        self.assertIsNotNone(error.task_id)
+        process = self.cli('run', str(self.image))
+        self.assertEqual(process.returncode, 1)
+        data = json.loads(process.stderr)
+        self.assertEqual(data['error_details']['error_code'], error.error_code)
+        self.assertEqual(self.client.jobs()['total'], 0)
+        self.assertFalse(self.app.backend.events)
+
+    def test_storage_wait_and_timeout_keep_diagnostics_through_stream_and_cli(self):
+        def reserve(*args):
+            raise StorageQuotaExceeded('resident', used_bytes=99, reserved_bytes=1,
+                                       requested_bytes=20, limit_bytes=100,
+                                       disk_free_bytes=100000000, required_free_bytes=1000)
+        self.app.backend.reserve_storage = reserve
+        task = self.client.submit(self.image, queue_timeout=1)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            queued = self.client.job(task.id)
+            if queued.waiting_details:
+                break
+            time.sleep(.005)
+        self.assertEqual(queued.state, 'queued')
+        self.assertEqual(queued.waiting_details['used_bytes'], 99)
+        self.assertIsNone(queued.started)
+        self.assertFalse(queued.waiting_details['hardware_started'])
+        self.assertIsNotNone(queued.retry_at)
+        process = self.cli('job', task.id, json_output=False)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        for text in ('storage quota exceeded', 'Capacity:', 'Filesystem free:', 'Hardware started: no', 'Next retry:'):
+            self.assertIn(text, process.stdout)
+        with self.app.queue.lock, self.app.queue.db:
+            self.app.queue.db.execute('UPDATE jobs SET created=? WHERE id=?', (time.time() - 2, task.id))
+        self.app.queue.dispatch_once()
+        with self.client.stream_output(task.id) as stream, self.assertRaises(SchedulerError) as caught:
+            list(stream)
+        self.assertEqual(caught.exception.task_id, task.id)
+        self.assertEqual(caught.exception.error_code, 'queue_timeout')
+        self.assertEqual(caught.exception.details['cause']['error_code'], 'resident_storage_quota_exceeded')
+        self.assertEqual(caught.exception.details['cause']['used_bytes'], 99)
+        self.assertFalse(self.app.backend.events)
+
+    def test_storage_health_uses_cached_usage_without_io_locks(self):
+        metrics = dict(used_bytes=20, reserved_bytes=30, limit_bytes=100,
+                       disk_free_bytes=100000000, sampled_at=time.time())
+        self.app.backend.storage_status = lambda: metrics
+        # Hold the image lock across the HTTP request: health must not scan or
+        # wait for an upload/retention operation to finish.
+        with self.app.queue.images.lock:
+            health = self.client.health()
+        self.assertEqual(health['storage']['resident'], metrics)
+        self.assertEqual(health['storage']['input']['used_bytes'], 0)
 
     def test_shared_clients_and_queue_survives_wait_timeout(self):
         self.app.queue.backend.duration = .1

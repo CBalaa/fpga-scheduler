@@ -12,6 +12,7 @@ import time
 
 from .models import (ACTIVE, STATES, BUSY_EXIT, BUSY_TOKEN, Cancellation,
                      CancelledError, Conflict, cancelled_result, task_id, validate)
+from .storage import StorageQuotaExceeded
 
 LOG = logging.getLogger(__name__)
 
@@ -51,9 +52,11 @@ class JobQueue:
                 started REAL, finished REAL, node TEXT, fpga INTEGER, result TEXT, error TEXT)''')
             self.db.execute('CREATE INDEX IF NOT EXISTS jobs_state_seq ON jobs(state,seq)')
             columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
-            for name in ('session_id', 'cancel_reason'):
+            for name in ('session_id', 'cancel_reason', 'waiting_details', 'error_details'):
                 if name not in columns:
                     self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} TEXT')
+            if 'retry_at' not in columns:
+                self.db.execute('ALTER TABLE jobs ADD COLUMN retry_at REAL')
             self.db.execute('CREATE INDEX IF NOT EXISTS jobs_session ON jobs(session_id,state)')
             self.db.execute('''CREATE TABLE IF NOT EXISTS client_sessions (
                 id TEXT PRIMARY KEY, heartbeat REAL NOT NULL, lease_seconds REAL NOT NULL,
@@ -211,9 +214,21 @@ class JobQueue:
             data = {key: row[key] for key in ('id', 'state', 'created', 'started', 'finished', 'node', 'fpga', 'error')}
             if row['result']:
                 data['result'] = json.loads(row['result'])
+            if row['error_details']:
+                data['error_details'] = json.loads(row['error_details'])
             if row['state'] == 'queued':
                 data['position'] = self.db.execute("SELECT count(*) FROM jobs WHERE state='queued' AND seq<=?", (row['seq'],)).fetchone()[0]
                 data['waiting_reason'] = self.status_error or 'Waiting for an available FPGA'
+                if row['waiting_details']:
+                    data['waiting_details'] = json.loads(row['waiting_details'])
+                    data['waiting_reason'] = data['waiting_details']['message']
+                    data['retry_at'] = row['retry_at']
+                else:
+                    head = self.db.execute("SELECT id,waiting_details,retry_at FROM jobs WHERE state='queued' ORDER BY seq LIMIT 1").fetchone()
+                    if head and head['waiting_details']:
+                        data['waiting_reason'] = 'Waiting behind an earlier task blocked by storage capacity'
+                        data['waiting_details'] = {**json.loads(head['waiting_details']), 'blocked_by': head['id']}
+                        data['retry_at'] = head['retry_at']
             return data
 
     def output(self, ident, offset=0, limit=65536):
@@ -357,7 +372,8 @@ class JobQueue:
             self.maintenance = threading.Thread(target=self._cleanup_remote, args=(now - self.retention,),
                                                 name='fpga-retention')
             self.maintenance.start()
-        if not waiting or self.stopping.is_set():
+        if (not waiting or self.stopping.is_set()
+                or (waiting[0]['retry_at'] or 0) > time.time()):
             return
         ports = self.inventory()['devices']
         with self.lock, self.db:
@@ -373,9 +389,22 @@ class JobQueue:
                 if time.time() - job['created'] >= json.loads(job['payload'])['queue_timeout']:
                     self._expire(job['id'])
                     continue
-                changed = self.db.execute("UPDATE jobs SET state='running',node=?,fpga=?,started=?,error=NULL WHERE id=? AND state='queued'",
+                if self.get(job['id'])['state'] != 'queued':
+                    continue
+                if (job['retry_at'] or 0) > time.time():
+                    break  # Do not let newer FIFO tickets bypass resource waits.
+                if hasattr(self.backend, 'reserve_storage'):
+                    try:
+                        self.backend.reserve_storage(json.loads(job['payload']), self.images.path(job['id']))
+                    except StorageQuotaExceeded as error:
+                        self._wait_for_storage_locked(job['id'], error)
+                        break
+                changed = self.db.execute("""UPDATE jobs SET state='running',node=?,fpga=?,started=?,error=NULL,
+                                          error_details=NULL,waiting_details=NULL,retry_at=NULL WHERE id=? AND state='queued'""",
                                           (node, port, time.time(), job['id'])).rowcount
                 if not changed:
+                    if hasattr(self.backend, 'release_prepared'):
+                        self.backend.release_prepared(job['id'])
                     continue
                 self.next_node = (self.nodes.index(node) + 1) % len(self.nodes)
                 self.reserved.add((node, port))
@@ -391,6 +420,8 @@ class JobQueue:
                     self.reserved.discard((node, port))
                     self.workers.discard(worker)
                     self.controls.pop(job['id'], None)
+                    if hasattr(self.backend, 'release_prepared'):
+                        self.backend.release_prepared(job['id'])
                     self.db.execute("UPDATE jobs SET state='queued',node=NULL,fpga=NULL,started=NULL WHERE id=?",
                                     (job['id'],))
                     self.db.commit()
@@ -403,8 +434,26 @@ class JobQueue:
             LOG.warning('Remote retention cleanup unavailable', exc_info=True)
 
     def _expire(self, ident):
-        self.db.execute("UPDATE jobs SET state='failed',finished=?,error=? WHERE id=? AND state='queued'",
-                        (time.time(), 'Queue timeout; hardware was not started', ident))
+        waiting = self.get(ident).get('waiting_details')
+        error = 'Queue timeout; hardware was not started'
+        details = dict(error_code='queue_timeout', phase='admission', hardware_started=False)
+        if waiting:
+            error = ('Queue timeout while waiting for storage capacity (' +
+                     waiting.get('reason', 'storage unavailable') + '); hardware was not started')
+            details['cause'] = waiting
+        self.db.execute("""UPDATE jobs SET state='failed',finished=?,error=?,error_details=?,
+                           waiting_details=NULL,retry_at=NULL WHERE id=? AND state='queued'""",
+                        (time.time(), error, json.dumps(details), ident))
+
+    def _wait_for_storage_locked(self, ident, error):
+        delay = getattr(self.backend, 'storage_retry_seconds', 10)
+        details = {**error.details, 'reason': error.summary,
+                   'message': f'{error.summary}; retrying in {delay:g}s; hardware was not started',
+                   'retry_after_seconds': delay}
+        self.db.execute('''UPDATE jobs SET state='queued',started=NULL,finished=NULL,node=NULL,fpga=NULL,
+                           error=NULL,result=NULL,error_details=NULL,waiting_details=?,retry_at=? WHERE id=?''',
+                        (json.dumps(details), time.time() + delay, ident))
+        LOG.warning('Task %s waiting for storage: %s', ident, error)
 
     @staticmethod
     def _result_state(result):
@@ -415,6 +464,7 @@ class JobQueue:
     def execute(self, job, node, port, control):
         payload = json.loads(job['payload'])
         result, error, state, launched = None, None, 'failed', False
+        error_details, storage_wait = None, None
         try:
             control.check()
             image = self.images.freeze(payload['id'], payload['sha256'])
@@ -443,10 +493,17 @@ class JobQueue:
         except CancelledError as exc:
             result = cancelled_result(str(exc), node=node)
             state = 'cancelled'
+        except StorageQuotaExceeded as exc:
+            if launched:
+                error, error_details = str(exc), {**exc.details, 'phase': 'execution', 'hardware_started': None}
+            else:
+                state, storage_wait = 'queued', exc
         except Exception:
             error = ('Execution connection lost; outcome unknown; not replayed' if launched else
                      'Input transfer or verification failed; hardware was not started')
             result = None
+            error_details = dict(error_code='execution_outcome_unknown' if launched else 'input_prepare_failed',
+                                 phase='execution' if launched else 'prepare', hardware_started=None if launched else False)
             LOG.exception('Task %s failed', job['id'])
             if not launched and control.reason:
                 result, error, state = cancelled_result(control.reason, node=node), None, 'cancelled'
@@ -457,16 +514,18 @@ class JobQueue:
                 reason = control.finish()
                 if state == 'queued' and reason:
                     result, state = cancelled_result(reason, node=node), 'cancelled'
-                self.db.execute('''UPDATE jobs SET state=?,result=?,error=?,finished=?,fpga=?,node=?,
+                self.db.execute('''UPDATE jobs SET state=?,result=?,error=?,error_details=?,finished=?,fpga=?,node=?,
                     started=CASE WHEN ? THEN NULL ELSE started END WHERE id=?''',
-                    (state, json.dumps(result) if result else None, error,
+                    (state, json.dumps(result) if result else None, error, json.dumps(error_details) if error_details else None,
                      None if state == 'queued' else time.time(), None if state == 'queued' else port,
                      None if state == 'queued' else node, state == 'queued', job['id']))
+                if storage_wait and state == 'queued':
+                    self._wait_for_storage_locked(job['id'], storage_wait)
                 self.db.commit()
                 self.reserved.discard((node, port))
                 clean_abort = (result and result.get('execution_status') in ('timeout', 'cancelled')
                                and result.get('details', {}).get('reset_confirmed') is True)
-                if state == 'failed' and not clean_abort:
+                if state == 'failed' and launched and not clean_abort:
                     self.db.execute('INSERT OR REPLACE INTO cooldowns VALUES (?,?,?)', (node, port, time.time() + self.cooldown))
                 self.workers.discard(threading.current_thread())
                 self.controls.pop(job['id'], None)

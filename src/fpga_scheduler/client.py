@@ -51,10 +51,15 @@ atexit.register(_close_clients)
 
 
 class SchedulerError(RuntimeError):
-    def __init__(self, message, status=None, ident=None):
+    def __init__(self, message, status=None, ident=None, *, details=None):
         super().__init__(message)
         self.status = status
         self.task_id = ident
+        self.details = details or {}
+
+    @property
+    def error_code(self):
+        return self.details.get('error_code')
 
 
 @dataclass
@@ -87,6 +92,9 @@ class Task:
     position: int | None = None
     waiting_reason: str | None = None
     result: Result | None = None
+    waiting_details: dict | None = None
+    error_details: dict | None = None
+    retry_at: float | None = None
 
     @classmethod
     def from_dict(cls, value):
@@ -172,7 +180,8 @@ class OutputStream:
                     yield text
                 if self._finished:
                     if self.result is None:
-                        raise SchedulerError(self.task.error or f'Task {self.task.state}', ident=self.id)
+                        raise SchedulerError(self.task.error or f'Task {self.task.state}', ident=self.id,
+                                             details=self.task.error_details)
                     return
                 if self.deadline is not None and time.monotonic() >= self.deadline:
                     raise SchedulerError(f'Stream timed out; task remains queryable: {self.id}', ident=self.id)
@@ -301,11 +310,14 @@ class Client:
             with urlopen(request, timeout=self.request_timeout if _timeout is None else _timeout) as response:
                 return json.load(response)
         except HTTPError as error:
+            details = None
             try:
-                detail = json.load(error).get('error', f'HTTP {error.code}')
+                body = json.load(error)
+                detail = body.get('error', f'HTTP {error.code}')
+                details = body.get('error_details')
             except (ValueError, OSError):
                 detail = f'HTTP {error.code}'
-            raise SchedulerError(detail, error.code) from None
+            raise SchedulerError(detail, error.code, details=details) from None
         except (URLError, TimeoutError, OSError, ValueError, HTTPException) as error:
             raise SchedulerError(f'Connection or response failed ({type(error).__name__}); query the same task ID before resubmitting') from None
 
@@ -459,7 +471,8 @@ class Client:
         try:
             if show:
                 reader.on_update = lambda t: print(
-                    f'[FPGA] {t.state} position={t.position} node={t.node} port={t.fpga}', flush=True)
+                    f'[FPGA] {t.state} position={t.position} node={t.node} port={t.fpga}' +
+                    (f' | {t.waiting_reason}' if t.waiting_reason else ''), flush=True)
                 try:
                     for text in reader:
                         print(text, end='', flush=True)
@@ -480,5 +493,5 @@ class Client:
     @staticmethod
     def _result(task):
         if task.result is None:
-            raise SchedulerError(task.error or f'Task {task.state}', ident=task.id)
+            raise SchedulerError(task.error or f'Task {task.state}', ident=task.id, details=task.error_details)
         return task.result

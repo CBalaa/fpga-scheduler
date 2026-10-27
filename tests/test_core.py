@@ -11,7 +11,7 @@ from fpga_scheduler.backends.simulator import Simulator
 from fpga_scheduler.config import Node, load
 from fpga_scheduler.models import BUSY_TOKEN, Conflict, MAX_IMAGE, validate
 from fpga_scheduler.queue import JobQueue
-from fpga_scheduler.storage import Images
+from fpga_scheduler.storage import Images, StorageQuotaExceeded
 
 NODES = (Node('a', (4, 5)), Node('b', (4, 5)))
 
@@ -188,6 +188,61 @@ class QueueTests(unittest.TestCase):
         self.q.dispatch_once()
         self.assertEqual(self.q.get(f'{1:032x}')['state'], 'failed')
         self.assertFalse(self.backend.events)
+
+    def test_storage_wait_survives_restart_and_expiry_explains_the_cause(self):
+        def reserve(payload, image):
+            raise StorageQuotaExceeded('resident', used_bytes=99, reserved_bytes=1,
+                                       requested_bytes=20, limit_bytes=100)
+        self.backend.reserve_storage = reserve
+        task = self.submit(1, queue_timeout=1)
+        with self.assertLogs('fpga_scheduler.queue', level='WARNING'):
+            self.q.dispatch_once()
+        waiting = self.q.get(task['id'])
+        self.q.close()
+        self.q = JobQueue(self.root / 'jobs.db', self.backend, self.images)
+        self.assertEqual(self.q.get(task['id']), waiting)
+        with self.q.db:
+            self.q.db.execute('UPDATE jobs SET created=? WHERE id=?', (time.time() - 2, task['id']))
+        self.q.dispatch_once()
+        failed = self.q.get(task['id'])
+        self.assertEqual(failed['state'], 'failed')
+        self.assertIsNone(failed['started'])
+        self.assertIsNone(failed['fpga'])
+        self.assertEqual(failed['error_details']['error_code'], 'queue_timeout')
+        self.assertEqual(failed['error_details']['cause']['error_code'], 'resident_storage_quota_exceeded')
+        self.assertEqual(failed['error_details']['cause']['used_bytes'], 99)
+        self.assertIn('storage capacity', failed['error'])
+        self.assertFalse(self.backend.events)
+        self.assertTrue(self.images.path(task['id']).exists())
+
+    def test_cancelling_a_storage_wait_does_not_block_the_next_ticket(self):
+        def reserve(payload, image):
+            if payload['id'] == f'{1:032x}':
+                raise StorageQuotaExceeded('resident', used_bytes=100, requested_bytes=1, limit_bytes=100)
+        self.backend.reserve_storage = reserve
+        first, second = self.submit(1), self.submit(2)
+        with self.assertLogs('fpga_scheduler.queue', level='WARNING'):
+            self.q.dispatch_once()
+        self.q.cancel(first['id'])
+        self.q.dispatch_once()
+        self.finish()
+        self.assertEqual(self.q.get(first['id'])['state'], 'cancelled')
+        self.assertEqual(self.q.get(second['id'])['state'], 'completed')
+        self.assertNotIn('waiting_details', self.q.get(second['id']))
+
+    def test_prepare_storage_failure_is_retried_without_hardware_cooldown(self):
+        def prepare(*args, **kwargs):
+            raise StorageQuotaExceeded('resident', used_bytes=100, requested_bytes=1, limit_bytes=100)
+        self.backend.prepare = prepare
+        task = self.submit(1)
+        with self.assertLogs('fpga_scheduler.queue', level='WARNING'):
+            self.q.dispatch_once()
+            self.finish()
+        self.assertEqual(self.q.get(task['id'])['state'], 'queued')
+        self.assertIsNone(self.q.get(task['id'])['started'])
+        self.assertFalse(self.backend.events)
+        self.assertFalse(self.q.reserved)
+        self.assertEqual(self.q.db.execute('SELECT count(*) FROM cooldowns').fetchone()[0], 0)
 
     def test_expiry_during_probe(self):
         self.submit(1, queue_timeout=1)

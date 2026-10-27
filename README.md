@@ -83,6 +83,8 @@ fpga-scheduler daemon start
 
 CLI 默认显示状态摘要和表格；脚本读取原始数据时加上 `--json`，例如 `fpga-scheduler daemon status --json` 或 `fpga-scheduler jobs --json`。
 
+存储配额不足时任务保持排队，`jobs/job` 显示原因及用量，容量恢复后自动继续；超过 `--queue-timeout` 才失败。`daemon status` 可查看配额，管理员可调整 `[resident].max_storage_bytes`（默认 1 GiB，输入与运行文件各占一半）或顶层 `retention_days` 后正常重启。安全收尾后的临时镜像/readback 默认自动回收，输入、UART 和导出文件仍按保留期保存，详见[存储说明](docs/resident-runtime.md#存储验收与限制)。
+
 终端自动启用颜色：绿色表示正常，青色表示执行中，黄色表示等待/恢复/取消，红色表示失败/隔离。重定向和 JSON 默认不加颜色；可用 `--color always` 强制开启、`--color never` 或环境变量 `NO_COLOR=1` 关闭。
 
 ## 3. 通过 127.0.0.1 执行 bin

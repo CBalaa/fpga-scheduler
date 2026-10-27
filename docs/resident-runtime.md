@@ -113,6 +113,8 @@ rv64gc/lp64d、5.5296 MHz / 115200 UART。释放 CPU 前 fsync start intent，
 收尾复位、UART 静默边界确认后原子保存结果，再释放执行槽。普通 PASS 不表示任务成功。
 正常退出（含非零应用码）保留会话。取消/超时在 CPU 复位读回及 UART 清理均成功后
 同样保留 UVHS PID/session、回到 READY，不重新 download/initialize、不进入失败冷却。
+取消/超时打断半条 UART 协议记录时，在确认复位与静默边界后记录 `uart_record_interrupted=true`，
+不将截断本身当作收尾失败；完整记录的格式、顺序和重复检查仍有效。
 取消/超时期间控制通道或收尾失败则 QUARANTINED，记录原因，不自动完整重建。
 装载取消等待当前 writemem/readmem 确认结束后收尾；等待受 command_timeout 约束。
 UVHS 命令没有确认时不再并发发送 reset，按平台失败隔离，禁止释放 CPU 和写入下一任务。
@@ -135,10 +137,31 @@ SQLite WAL+FULL，状态目录单实例；端口 flock 覆盖 session 并由 UVH
 
 state_dir 保存 SQLite、images、resident/jobs/<id> 的 UART、镜像/readback、start intent 和结果；
 resident/ports/<port> 保存 session 身份和控制日志。输入与 resident 工件各使用 max_storage_bytes
-一半预算，任务准备预留空间，不通过删除活动输入腾空间。UART 有上限，超限失败；
+一半预算（默认各 512 MiB），与文件系统剩余空间分别检查。
+任务分配端口前预留峰值空间；已经落盘的活动文件只占已用空间，对该任务仅保留尚未落盘的预算，
+避免双端口并发时重复计账。预算覆盖补齐镜像、DDR 读回、UART 与其 JSON 结果副本、输出快照及 artifacts。
+UART 有上限，超限失败；
 控制日志保留当前及上一份，service/supervisor 日志轮转。厂商自身日志计入 resident 配额，
 但由厂商写入；准入检查不能替代文件系统硬配额，管理员仍需监控空间。
-每小时清理过期终态；保留记录及活动任务输入受保护。
+
+默认 `keep_load_files=false`：任务原子保存结果、确认 DDR 读回匹配和 CPU 复位后，
+删除该任务的 `image.bin/readback.bin` 装载副本；取消/超时符合这两个条件也可回收。
+校验失败、未确认安全收尾或无可靠终态的任务保留这些文件。
+启动升级后的服务时，同样回收符合条件的历史副本；`keep_load_files=true` 可保留至完整任务过期，供调试使用。
+原始上传输入、UART、start intent、result.json 和导出 artifacts 仍按 `retention_days` 保留，
+每小时清理过期终态，不为容量压力提前删除这些记录或活动任务输入。
+
+resident 配额或文件系统空间不足时，任务保持 `queued`，`started/node/fpga` 为空，
+不调用任务 prepare/run，也不对端口施加故障冷却。按 `storage_retry_seconds`（默认 10 秒）重试，
+后续任务保持 FIFO；容量恢复后原 ID 自动继续，无需重新提交。
+`queue_timeout` 包含这段等待，超时后说明存储等待原因，附带最后一次容量采样，确认硬件未启动。
+输入上传本身超配额则 HTTP 503 拒绝，不创建任务；SDK 异常仍携带 ID 和结构化原因。
+
+`fpga-scheduler job <id>` / `jobs` 显示配额等待、已用/剩余预留/请求量、配额上限和磁盘余量；
+`daemon status` / `health` 显示两部分配额的缓存采样，查询不等待硬件锁或扫描磁盘。
+SDK 使用 `task.waiting_details`、`task.retry_at` 或 `SchedulerError.details` 获取相同信息。
+管理员可增大 `[resident].max_storage_bytes`，或减小顶层 `retention_days` 后正常重启服务。
+不要因磁盘余量充足就关闭配额，也不要直接删除活动任务目录。
 
 离线：PYTHONPATH=src python3 -m unittest discover -s tests -v。
 真机工具 [resident_acceptance.py](../tools/resident_acceptance.py) 要求恰好 4、5 READY，

@@ -138,7 +138,8 @@ def load(path):
     fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout',
               'uart_quiet_seconds', 'recovery_attempts', 'recovery_backoff',
               'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile', 'shared_clock_index',
-              'output_ddr_base', 'output_ddr_bytes', 'max_output_bytes', 'explicit_allocation'}
+              'output_ddr_base', 'output_ddr_bytes', 'max_output_bytes', 'explicit_allocation',
+              'keep_load_files', 'storage_retry_seconds'}
     if set(resident) - fields:
         raise ValueError('Unknown resident options')
     if backend == 'bosc-resident':
@@ -156,6 +157,8 @@ def load(path):
         raise ValueError('shared_clock_index must be an integer in 0..23')
     if type(resident.get('explicit_allocation', False)) is not bool:
         raise ValueError('explicit_allocation must be a boolean')
+    if type(resident.get('keep_load_files', False)) is not bool:
+        raise ValueError('keep_load_files must be a boolean')
     # i_ddr[0] corresponds to this profile's physical DDR base, not a user-selected base.
     if resident.get('output_ddr_base', 0x80000000) != 0x80000000 or type(resident.get('output_ddr_base', 0x80000000)) is not int:
         raise ValueError('output_ddr_base must be 0x80000000 for this hardware profile')
@@ -166,7 +169,8 @@ def load(path):
             raise ValueError(f'{name} must be an integer within 1..{maximum}')
     if resident.get('output_ddr_bytes', 4194304) % 64:
         raise ValueError('output_ddr_bytes must be a multiple of 64')
-    for name in fields - {'hardware_project', 'lock_dir', 'profile', 'shared_clock_index', 'output_ddr_base', 'explicit_allocation'}:
+    for name in fields - {'hardware_project', 'lock_dir', 'profile', 'shared_clock_index', 'output_ddr_base',
+                          'explicit_allocation', 'keep_load_files'}:
         if name in resident:
             positive(resident[name], name)
     for name in ('recovery_attempts', 'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes'):

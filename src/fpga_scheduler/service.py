@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, urlsplit
 from .backends.simulator import Simulator
 from .models import ACTIVE, MAX_IMAGE, Conflict
 from .queue import JobQueue
-from .storage import Images
+from .storage import Images, StorageQuotaExceeded
 
 LOG = logging.getLogger(__name__)
 
@@ -115,9 +115,12 @@ def make_server(address, queue, images, token):
                 if self.command == 'GET' and route == '/health':
                     alive = queue.dispatcher is not None and queue.dispatcher.is_alive()
                     ok = alive and not queue.stopping.is_set()
+                    storage = {}
+                    if hasattr(queue.backend, 'storage_status'):
+                        storage = dict(storage=dict(resident=queue.backend.storage_status(), input=images.storage_status()))
                     self.reply(200 if ok else 503, dict(service='fpga-scheduler', pid=os.getpid(), backend=type(queue.backend).__name__,
                                                       dispatcher_alive=alive, stopping=queue.stopping.is_set(),
-                                                      hardware_checked=False, scheduler_error=queue.status_error))
+                                                      hardware_checked=False, scheduler_error=queue.status_error, **storage))
                 elif self.command == 'GET' and route == '/devices':
                     self.reply(200, queue.inventory())
                 elif self.command == 'PUT' and session and not session[2]:
@@ -165,6 +168,8 @@ def make_server(address, queue, images, token):
                 self.reply(409, {'error': str(error)})
             except (ValueError, UnicodeError) as error:
                 self.reply(400, {'error': str(error)})
+            except StorageQuotaExceeded as error:
+                self.reply(503, dict(error=str(error), error_details=error.details))
             except OverflowError as error:
                 self.reply(503, {'error': str(error)})
             except (TimeoutError, socket.timeout):

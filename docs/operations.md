@@ -98,6 +98,11 @@ rm -rf -- "$FPGA_RETIRED_DIR"
 
 新增 bosc-resident，使用 daemon start/status/stop 管理用户态 supervisor；
 配置路径由 --config 或 FPGA_SCHEDULER_CONFIG 指定。
+存储准入不足时保持 queued 并退避重试，不占 FPGA 端口、不记硬件冷却；job/jobs 显示容量诊断。
+max_storage_bytes 默认 1 GiB，输入和 resident 文件各占一半；磁盘剩余空间另行检查。
+默认在可靠结果保存、DDR 校验匹配及复位确认后回收 image.bin/readback.bin，
+历史安全任务在升级启动时同样回收；keep_load_files=true 可保留用于调试。
+原始输入、UART、结果与 artifacts 仍按保留期保存，不能通过手工批量删除活动目录释放空间。
 完整安装、共享令牌分发、端口锁、板级恢复与限制见 [常驻运行时](resident-runtime.md)。
 正常 stop 会 drain 并卸载；更换白名单之前用旧配置正常停止。
 使用 systemd 时运行 serve，避免叠加 supervisor。SQLite WAL 与主库须一起备份，

@@ -2,6 +2,7 @@
 import fcntl
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -18,16 +19,19 @@ from ..remote.runner import platform_error
 from ..remote.runtime import parse_fpgas
 from ..remote.uvhs_session import Session, atomic_json, fingerprint, retire_record
 from ..artifacts import validate_artifacts
+from ..storage import StorageQuotaExceeded
 
 
 NH_CLOCK_HZ = 5529600
+LOG = logging.getLogger(__name__)
 
 
 class Resident:
     supports_cancellation = True
     def __init__(self, nodes, state_dir, *, hardware_project, lock_dir,
                  recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824,
-                 shared_clock_index=6, explicit_allocation=False, **options):
+                 shared_clock_index=6, explicit_allocation=False, keep_load_files=False,
+                 storage_retry_seconds=10, **options):
         if len(nodes) != 1:
             raise ValueError('Resident backend manages exactly one local node')
         self.nodes, self.node = nodes, nodes[0]
@@ -44,6 +48,8 @@ class Resident:
         self.explicit_allocation = explicit_allocation
         self.recovery_attempts, self.backoff = recovery_attempts, recovery_backoff
         self.max_storage = max_storage_bytes
+        self.keep_load_files = keep_load_files
+        self.storage_retry_seconds = storage_retry_seconds
         self.guard = threading.RLock()
         self.sessions = {}
         self.states = {p: dict(state='RECOVERING', attempts=0, next_retry=0, reason='Not initialized') for p in self.node.ports}
@@ -63,6 +69,10 @@ class Resident:
                     raise RuntimeError('Stop with the previous whitelist before changing ports')
             else:
                 retire_record(path)
+        # Only reliable terminal records with verified readback and reset allow
+        # removal of old load copies. This also reclaims pre-upgrade scratch.
+        self._prune_load_files()
+        self._storage_usage()
 
     def _bootstrap(self, number):
         source = bind_port((self.project / 'user_script/hw_run' / f'hw_run{number}.tcl').read_text(), number,
@@ -269,32 +279,71 @@ class Resident:
                          downloads=self.sessions[p].downloads if p in self.sessions else 0)
                     for p, s in self.states.items()]
 
+    def _storage_usage(self):
+        used, materialized = 0, {}
+        for path in self.root.rglob('*'):
+            try:
+                if path.is_symlink() or not path.is_file():
+                    continue
+                size = path.stat().st_size
+            except FileNotFoundError:
+                continue  # A snapshot or atomically replaced file just retired.
+            used += size
+            relative = path.relative_to(self.root).parts
+            if len(relative) >= 3 and relative[0] == 'jobs':
+                materialized[relative[1]] = materialized.get(relative[1], 0) + size
+        # Files and reservations must use the same sample. Each active job is
+        # charged max(its peak budget, its materialized files), never both.
+        remaining = sum(max(0, budget - materialized.get(ident, 0))
+                        for ident, budget in self.storage_reserved.items())
+        self._usage = dict(used_bytes=used, reserved_bytes=remaining,
+                           limit_bytes=self.max_storage // 2,
+                           disk_free_bytes=shutil.disk_usage(self.root).free, sampled_at=time.time())
+        return self._usage
+
+    def storage_status(self):
+        # No hardware guard or filesystem scan on the HTTP health path.
+        return dict(self._usage)
+
     def _check_storage(self, reserve=0):
-        used = sum(p.stat().st_size for p in self.root.rglob('*') if p.is_file() and not p.is_symlink())
-        reserve += sum(self.storage_reserved.values())
-        if used + reserve > self.max_storage // 2 or shutil.disk_usage(self.root).free < reserve + 16777216:
-            raise OSError('Resident storage quota exceeded; retained active inputs are protected')
+        usage = self._storage_usage()
+        required_free = usage['reserved_bytes'] + reserve + 16777216
+        if (usage['used_bytes'] + usage['reserved_bytes'] + reserve > usage['limit_bytes']
+                or usage['disk_free_bytes'] < required_free):
+            raise StorageQuotaExceeded('resident', requested_bytes=reserve, required_free_bytes=required_free, **usage)
+
+    def reserve_storage(self, payload, image):
+        """Admission before the queue assigns a port or marks a job running."""
+        with self.guard:
+            if payload['id'] in self.storage_reserved:
+                return
+            reserve = (max(1048576, (image.stat().st_size + 1048575) // 1048576 * 1048576) * 2 +
+                       self.options.get('max_job_log_bytes', 1048576) * 13 + 65536 +
+                       self.options.get('output_ddr_bytes', 4194304) +
+                       self.options.get('max_output_bytes', 16777216))
+            # Raw UART plus the two JSON-escaped output copies in result.json
+            # can require 13 times the UART limit, plus bounded metadata.
+            self._check_storage(reserve)
+            self.storage_reserved[payload['id']] = reserve
+            self._usage = {**self._usage, 'reserved_bytes': self._usage['reserved_bytes'] + reserve}
 
     def prepare(self, payload, node, image, *, cancellation=None):
         if cancellation:
             cancellation.check()
         if node != self.node.id:
             raise ValueError('Unknown node')
-        reserve = (max(1048576, (image.stat().st_size + 1048575) // 1048576 * 1048576) * 2 +
-                   self.options.get('max_job_log_bytes', 1048576) * 2 +
-                   self.options.get('output_ddr_bytes', 4194304) +
-                   self.options.get('max_output_bytes', 16777216))
         if hashlib.sha256(image.read_bytes()).hexdigest() != payload['sha256']:
             raise ValueError('Input checksum mismatch')
         with self.guard:
-            self._check_storage(reserve)
-            self.storage_reserved[payload['id']] = reserve
+            self.reserve_storage(payload, image)
             self.inputs[payload['id']] = image
 
     def release_prepared(self, ident):
         with self.guard:
-            self.storage_reserved.pop(ident, None)
+            reserved = self.storage_reserved.pop(ident, None)
             self.inputs.pop(ident, None)
+            if reserved is not None:
+                self._storage_usage()
 
     def run(self, payload, node, port, *, cancellation=None):
         with self.guard:
@@ -302,7 +351,7 @@ class Resident:
                 raise ValueError('Port outside whitelist')
             image = self.inputs.pop(payload['id'])
             if self.stopped or self.states[port]['state'] != 'READY':
-                self.storage_reserved.pop(payload['id'], None)
+                self.release_prepared(payload['id'])
                 return dict(exit_code=BUSY_EXIT, output=BUSY_TOKEN, seconds=0)
             session = self.sessions[port]
             self.states[port].update(state='BUSY', reason='Task executing')
@@ -311,11 +360,12 @@ class Resident:
                                               cancellation=cancellation)
         except BaseException:
             with self.guard:
-                self.storage_reserved.pop(payload['id'], None)
+                self.release_prepared(payload['id'])
                 self.states[port].update(state='QUARANTINED', reason='Result publication failed; inspect hardware')
             raise
         with self.guard:
-            self.storage_reserved.pop(payload['id'], None)
+            self._prune_job_load_files(self.root / 'jobs' / payload['id'], result)
+            self.release_prepared(payload['id'])
             if healthy:
                 self.states[port].update(state='READY', reason='')
             else:
@@ -370,14 +420,63 @@ class Resident:
         from ..remote.runner import output_name
         return self.root / 'jobs' / task_id(ident) / 'artifacts' / (output_name(name) + '.bin')
 
+    def _prune_job_load_files(self, directory, result):
+        details = result.get('details') or {}
+        if (self.keep_load_files or not isinstance(details, dict) or details.get('reset_confirmed') is not True
+                or details.get('ddr_readback_matches') is not True):
+            return
+        paths = [directory / name for name in ('image.bin', 'readback.bin')]
+        if not any(path.exists() or path.is_symlink() for path in paths):
+            return
+        try:
+            timestamp = directory.stat()
+        except OSError:
+            LOG.warning('Could not inspect load scratch for task %s', directory.name, exc_info=True)
+            return
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                # The result is already durable. A cleanup failure must not
+                # turn a known application result into an unknown outcome.
+                LOG.warning('Could not remove load scratch for task %s', directory.name, exc_info=True)
+        try:
+            # Removing legacy scratch must not make an expired job look recent
+            # to retention, which uses the directory's last modification time.
+            os.utime(directory, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+        except OSError:
+            LOG.warning('Could not preserve retention time for task %s', directory.name, exc_info=True)
+
+    def _prune_load_files(self):
+        if self.keep_load_files:
+            return
+        for directory in (self.root / 'jobs').glob('*'):
+            if (not re.fullmatch('[0-9a-f]{32}', directory.name) or directory.is_symlink()
+                    or directory.name in self.storage_reserved or directory.name in self.inputs):
+                continue
+            if not any((directory / name).exists() or (directory / name).is_symlink()
+                       for name in ('image.bin', 'readback.bin')):
+                continue
+            try:
+                saved = json.loads((directory / 'result.json').read_text())
+                if (saved['id'] == directory.name and re.fullmatch('[0-9a-f]{64}', saved['sha256'])
+                        and isinstance(saved['result'], dict)):
+                    self._prune_job_load_files(directory, saved['result'])
+            except (OSError, ValueError, KeyError, TypeError):
+                continue  # An active/unknown task or damaged record is protected.
+
     def cleanup(self, before):
         # Queue retention runs first; image directories are the authoritative
         # protection set for queued, running and retained terminal jobs.
+        with self.guard:
+            self._prune_load_files()
         images = self.root.parent / 'images'
         for directory in (self.root / 'jobs').glob('*'):
             if (re.fullmatch('[0-9a-f]{32}', directory.name) and not (images / directory.name).exists()
                     and directory.stat().st_mtime < before):
                 shutil.rmtree(directory)
+        with self.guard:
+            self._storage_usage()
 
     def close(self):
         with self.guard:

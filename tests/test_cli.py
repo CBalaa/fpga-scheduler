@@ -209,6 +209,29 @@ class OutputTests(unittest.TestCase):
             _, stdout, _ = self.invoke('health')
             self.assertNotIn('\033[', stdout)
 
+    def test_storage_wait_views_explain_quota_separately_from_disk(self):
+        details = dict(error_code='resident_storage_quota_exceeded', phase='admission', hardware_started=False,
+                       used_bytes=494092257, reserved_bytes=16777216, requested_bytes=38862848,
+                       limit_bytes=536870912, disk_free_bytes=244 * 1024**3,
+                       action='Ask the administrator to increase resident.max_storage_bytes or shorten retention_days')
+        queued = dict(id='a' * 32, state='queued', position=1, retry_at=1,
+                      waiting_reason='Resident storage quota exceeded; retrying in 10s; hardware was not started',
+                      waiting_details=details)
+        for command, data in (('job', queued), ('jobs', dict(total=1, jobs=[queued]))):
+            text = render(command, data)
+            for expected in ('471.2 MiB used', '512.0 MiB quota', '244.0 GiB', 'max_storage_bytes'):
+                self.assertIn(expected, text)
+        text = render('job', queued)
+        self.assertIn('Hardware started: no', text)
+        self.assertIn('Next retry:', text)
+        health = dict(dispatcher_alive=True, storage=dict(resident={k: v for k, v in details.items()
+                                                                   if k.endswith('_bytes')}))
+        status = render('daemon', dict(supervisor_alive=True, api=health, queue=dict(total=1, jobs=[queued])),
+                        action='status')
+        self.assertIn('Resident storage: 471.2 MiB used', status)
+        self.assertIn('Filesystem free: 244.0 GiB', status)
+        self.assertIn('storage quota exceeded', status)
+
     def test_colored_tables_keep_same_text_alignment_and_full_ids(self):
         values = {
             'jobs': dict(total=2, jobs=[dict(id='a' * 32, state='running', node='sim', fpga=4),

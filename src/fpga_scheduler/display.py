@@ -73,6 +73,32 @@ def _timestamp(value):
     return '-' if value is None else time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(value))
 
 
+def _bytes(value):
+    if value is None:
+        return '-'
+    for unit in ('B', 'KiB', 'MiB', 'GiB', 'TiB'):
+        if abs(value) < 1024 or unit == 'TiB':
+            return f'{value:.1f} {unit}'
+        value /= 1024
+
+
+def capacity_details(details):
+    """Readable capacity evidence for a waiting task or a terminal error."""
+    if not details:
+        return []
+    cause = details.get('cause', details)
+    lines = []
+    if 'used_bytes' in cause:
+        lines.append(f'Capacity: {_bytes(cause["used_bytes"])} used + '
+                     f'{_bytes(cause.get("reserved_bytes", 0))} remaining reservations + '
+                     f'{_bytes(cause.get("requested_bytes", 0))} requested / {_bytes(cause["limit_bytes"])} quota')
+    if 'disk_free_bytes' in cause:
+        lines.append('Filesystem free: ' + _bytes(cause['disk_free_bytes']))
+    if cause.get('action'):
+        lines.append('Action: ' + _text(cause['action']))
+    return lines
+
+
 def jobs(data, *, color=False):
     tasks = data.get('jobs', [])
     lines = [f'Jobs: {data.get("total", len(tasks))} matching | showing {len(tasks)} | offset {data.get("offset", 0)}']
@@ -92,6 +118,9 @@ def jobs(data, *, color=False):
         if reason:
             lines.append(paint(f'  {task["id"]}: {_text(reason)}',
                                'red' if task.get('error') else 'yellow', color=color))
+        details = task.get('waiting_details') or task.get('error_details')
+        if details and not details.get('blocked_by'):
+            lines.extend('    ' + line for line in capacity_details(details))
     return '\n'.join(lines)
 
 
@@ -129,6 +158,11 @@ def health(data, *, color=False):
         lines.append(paint('Hardware: not checked by health; use devices for port status.', 'dim', color=color))
     if data.get('scheduler_error'):
         lines.append(paint(f'Scheduler warning: {_text(data["scheduler_error"])}', 'yellow', color=color))
+    for resource, usage in data.get('storage', {}).items():
+        lines.append(f'{resource.title()} storage: {_bytes(usage["used_bytes"])} used + '
+                     f'{_bytes(usage.get("reserved_bytes", 0))} remaining reservations / {_bytes(usage["limit_bytes"])} quota')
+        if 'disk_free_bytes' in usage:
+            lines.append('Filesystem free: ' + _bytes(usage['disk_free_bytes']))
     return '\n'.join(lines)
 
 
@@ -159,6 +193,9 @@ def daemon(action, data, *, color=False):
         lines.append('API: not queried (supervisor stopped)')
     if 'queue' in data:
         lines.append(f'Queue: {data["queue"]["total"]} active jobs (queued / running / cancelling)')
+        for job in data['queue'].get('jobs', []):
+            if job.get('waiting_details'):
+                lines.append(paint(f'  {job["id"]}: {_text(job["waiting_reason"])}', 'yellow', color=color))
     if data.get('queue_error'):
         lines.append(paint(f'Queue: unavailable | {_text(data["queue_error"])}', 'yellow', color=color))
     if 'ports' in data:
@@ -182,6 +219,14 @@ def task(data, *, include_output=True, color=False):
         lines.append(paint(f'Waiting: {_text(data["waiting_reason"])}', 'yellow', color=color))
     if data.get('error'):
         lines.append(paint(f'Error: {_text(data["error"])}', 'red', color=color))
+    details = data.get('waiting_details') or data.get('error_details')
+    if details:
+        lines.append(f'Reason: {_text(details.get("error_code"))} | phase {_text(details.get("phase"))}')
+        if details.get('hardware_started') is False:
+            lines.append('Hardware started: no')
+        lines.extend(capacity_details(details))
+    if data.get('retry_at') is not None:
+        lines.append('Next retry: ' + _timestamp(data['retry_at']))
     result = data.get('result')
     if result:
         status = result.get('execution_status')

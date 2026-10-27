@@ -30,7 +30,13 @@ recovery_attempts = 3
 recovery_backoff = 10
 max_job_log_bytes = 1048576
 max_session_log_bytes = 4194304
+# Half for uploaded inputs, half for resident files + remaining reservations.
 max_storage_bytes = 1073741824
+# Keep queued on capacity shortages; retry without reserving a hardware port.
+storage_retry_seconds = 10
+# Remove padded image/readback copies after verified DDR readback and reset.
+# Inputs, UART, durable results and exported artifacts retain retention_days.
+keep_load_files = false
 # Application-declared output must fit this physical DDR window.
 # Base is fixed by the NH profile. Span must be a multiple of 64, at most 256 MiB.
 output_ddr_base = 0x80000000

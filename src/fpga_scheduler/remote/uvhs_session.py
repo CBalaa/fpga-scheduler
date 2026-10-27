@@ -407,7 +407,16 @@ class Session:
                     uart.extend(data)
                     protocol.feed(data)
                 self.boundary()
-                protocol.finish()
+                try:
+                    protocol.finish()
+                except ProtocolError:
+                    if result['execution_status'] not in ('timeout', 'cancelled'):
+                        raise
+                    # Reset can stop UART in the middle of a START/RESULT
+                    # record. After verified reset and a quiet boundary this
+                    # is expected on abort, not a failure to reclaim the slot.
+                    # Complete malformed/duplicate records still fail feed().
+                    result['details']['uart_record_interrupted'] = True
                 reset_ok = True
             except (OSError, RuntimeError, ValueError) as error:
                 result['details'].setdefault('interrupted_status', result['execution_status'])

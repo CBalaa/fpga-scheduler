@@ -2,7 +2,8 @@
 
 服务仅接受共享 Bearer 令牌，包含 health 在内的所有接口均需
 Authorization: Bearer <token>。没有用户身份字段；令牌持有者可操作全部任务。
-客户端使用 UTF-8 JSON，文件接口使用原始二进制；错误响应为 {"error": "说明"}。
+客户端使用 UTF-8 JSON，文件接口使用原始二进制；错误响应含 {"error": "说明"}，
+存储不足还包含 `error_details`，无需 SSH 查日志定位原因。
 
 ## HTTP
 
@@ -67,6 +68,17 @@ queue_timeout 1–86400，均为整数秒，不接受布尔值或额外字段。
 时间为 Unix 秒；未开始/结束和未分配字段为 null。排队任务另有 position（从 1
 开始）、waiting_reason。存在执行响应时另有 result：output、exit_code、node、seconds、
 execution_status、app_exit_code、details、uart_output。
+Resident 存储不足的任务仍为 queued，另有 `waiting_details` 和 `retry_at`（Unix 秒）：
+`error_code` 区分 `resident_storage_quota_exceeded` 与 `filesystem_space_exhausted`，
+`phase=admission`、`hardware_started=false`，并给出 `used_bytes/reserved_bytes/requested_bytes/limit_bytes`、
+`disk_free_bytes/required_free_bytes`、管理员操作建议 `action` 和 `retry_after_seconds`。
+reserved_bytes 仅为尚未落盘的预留；不会与 used_bytes 中的活动文件重复计算。
+后续任务的 waiting_details 可含 blocked_by，表示 FIFO 中被哪个任务阻挡。
+容量恢复后清除等待字段，自动继续原任务；超过 queue_timeout 则失败，
+`error_details.error_code=queue_timeout`，`error_details.cause` 保留容量诊断；未启动硬件。
+输入上传超配额则直接 HTTP 503，error_details.error_code=input_storage_quota_exceeded，不创建任务。
+`started` 是队列分配执行槽的时间；result.details.application_started 表示是否观察到完整 START 记录，
+未观察到也可能已经释放 CPU，不能仅凭 started 认定程序已经启动。
 Resident 的 result 还可含 artifacts：每项为 name、address、nbytes、dtype、shape、sha256。
 任务没有导出文件时该字段可省略，SDK 将其解释为空列表。
 
@@ -83,6 +95,8 @@ UVHS 命令无确认是平台故障，不当作正常应用超时；不在未知
 排队取消也保存 cancelled 结果，hardware_started=false。cancelling 仍占用执行槽，输出接口 done=false；
 收尾失败则 platform_error / failed，details.interrupted_status 保留 cancelled 或 timeout，
 cleanup_error / cancel_reason 说明原因。已读 UART 保留；取消与完成按 worker 的最终判定先后顺序决定。
+取消/超时切断半条 START/RESULT/OUTPUT 时，若复位、UART 清空均确认成功，
+details.uart_record_interrupted=true，保留取消/超时结果并复用会话；完整畸形或重复记录仍按协议故障处理。
 uart_output 是独立的程序串口文本；output 保留串口与 UVHS 合并的完整会话日志。
 控制台与 UART 的输出可能在 output 中交错，校验程序输出时使用 uart_output。
 没有终态、仅出现 PASS 文本或 UVHS 正常退出，均不能报成功。
@@ -118,6 +132,18 @@ Result 有 output、node、exit_code、seconds、execution_status、app_exit_cod
 devices/health 返回原始字典。Client 的 request_timeout 是单次 HTTP 超时，默认 30 秒；
 wait(timeout=...) 是轮询等待期限，超时抛 SchedulerError，不会取消已提交任务。
 SchedulerError.status 为 HTTP 状态或 None；提交/等待错误携带 task_id 便于恢复查询。
+`SchedulerError.details` 保留结构化错误，`error_code` 为其错误码；没有结构化信息时为空字典 / None。
+`Task.waiting_details/error_details/retry_at` 支持存储等待与超时诊断，例如：
+
+~~~python
+task = client.job(task_id)
+if task.waiting_details:
+    print(task.waiting_reason, task.waiting_details, task.retry_at)
+~~~
+
+`health()` 的 resident 存储字段 `storage.input/storage.resident` 含已用量、配额上限及 sampled_at；
+resident 另有剩余预留与文件系统余量。它们来自最近一次准入、释放或清理的缓存采样，
+不会在健康检查中扫描目录或等待硬件操作。
 
 submit 上传后提交，仅在 POST 响应丢失时以同 ID 同参数重试一次。不会因不确定
 结果生成新 ID。显式使用原 ID 重试 submit 时，冻结上传返回 409 后由 POST 验证

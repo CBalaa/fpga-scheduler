@@ -17,7 +17,7 @@ from fpga_scheduler.backends.resident import Resident
 from fpga_scheduler.config import Node, load
 from fpga_scheduler.models import BUSY_EXIT
 from fpga_scheduler.queue import JobQueue
-from fpga_scheduler.storage import Images
+from fpga_scheduler.storage import Images, StorageQuotaExceeded
 from fpga_scheduler.remote.uvhs_session import BoundedLog, atomic_json, fingerprint, retire_record
 
 FIXTURE = Path(__file__).parent / 'fixtures/resident_uvhs.tcl'
@@ -75,8 +75,8 @@ class ResidentTests(unittest.TestCase):
                     continue
                 mode = lines[seen[p]]
                 seen[p] += 1
-                if mode == 'hang':
-                    os.write(fd, b'ordinary PASS\n')
+                if mode in ('hang', 'partial-start'):
+                    os.write(fd, b'ordinary PASS\n' if mode == 'hang' else b'@@FPGA_START {"version":')
                     continue
                 record = dict(version=1, status='exited', app_exit_code=int(mode) if mode.lstrip('-').isdigit() else 0)
                 if mode == 'trap':
@@ -161,6 +161,41 @@ class ResidentTests(unittest.TestCase):
             self.assertFalse((self.backend.root / 'jobs' / f'{i:032x}' / 'start-intent.json').exists())
             time.sleep(.02)
             self.ready()
+
+    def test_abort_mid_protocol_record_with_confirmed_reset_reuses_session(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        q = JobQueue(self.root / 'partial-record.db', self.backend, self.images, cooldown=60)
+        try:
+            for i, cancel in ((1, False), (2, True)):
+                payload = self.task(i, 'partial-start')
+                payload['timeout'] = 1
+                q.submit(payload)
+                q.dispatch_once()
+                deadline = time.monotonic() + .8
+                while time.monotonic() < deadline:
+                    data = self.backend.read_output(payload['id'], 0, 65536) or b''
+                    if data.startswith(b'@@FPGA_START'):
+                        break
+                    time.sleep(.005)
+                self.assertEqual(data, b'@@FPGA_START {"version":')
+                if cancel:
+                    q.cancel(payload['id'])
+                for worker in list(q.workers):
+                    worker.join(3)
+                result = q.get(payload['id'])['result']
+                self.assertEqual(result['execution_status'], 'cancelled' if cancel else 'timeout', result)
+                self.assertTrue(result['details']['reset_confirmed'])
+                self.assertTrue(result['details']['uart_record_interrupted'])
+                self.assertNotIn('cleanup_error', result['details'])
+                self.assertIs(self.backend.sessions[4], session)
+                self.assertEqual(self.backend.states[4]['state'], 'READY')
+            result = self.run_task(self.task(3))
+            self.assertEqual(result['exit_code'], 0)
+            self.assertEqual(result['details']['session'], session.epoch)
+            self.assertEqual(q.db.execute('SELECT count(*) FROM cooldowns').fetchone()[0], 0)
+        finally:
+            q.close()
 
     def test_live_uart_output_available_before_timeout(self):
         self.ready()
@@ -604,9 +639,162 @@ class ResidentTests(unittest.TestCase):
     def test_storage_limit_does_not_delete_inputs(self):
         payload = self.task(1)
         self.backend.max_storage = 1
-        with self.assertRaisesRegex(OSError, 'quota'):
+        with self.assertRaisesRegex(StorageQuotaExceeded, 'quota') as caught:
             self.backend.prepare(payload, 'local', self.images.path(payload['id']))
         self.assertTrue(self.images.path(payload['id']).exists())
+        self.assertEqual(caught.exception.details['error_code'], 'resident_storage_quota_exceeded')
+        self.assertFalse(caught.exception.details['hardware_started'])
+        self.assertGreater(caught.exception.details['requested_bytes'], caught.exception.details['limit_bytes'])
+        self.assertFalse(self.backend.storage_reserved)
+
+    def test_storage_wait_precedes_assignment_retries_and_preserves_fifo(self):
+        self.ready()
+        self.backend.max_storage = 1
+        q = JobQueue(self.root / 'storage.db', self.backend, self.images, cooldown=60)
+        first, second = self.task(1), self.task(2)
+        try:
+            q.submit(first)
+            q.submit(second)
+            with patch.object(self.backend, 'reserve_storage', wraps=self.backend.reserve_storage) as reserve:
+                with patch.object(self.backend, 'prepare') as prepare, patch.object(self.backend, 'run') as run:
+                    with self.assertLogs('fpga_scheduler.queue', level='WARNING'):
+                        q.dispatch_once()
+                    for _ in range(5):
+                        q.dispatch_once()
+                    self.assertEqual(reserve.call_count, 1)  # No wake/busy loop.
+                    prepare.assert_not_called()
+                    run.assert_not_called()
+            task = q.get(first['id'])
+            self.assertEqual((task['state'], task['position']), ('queued', 1))
+            self.assertIsNone(task['started'])
+            self.assertIsNone(task['fpga'])
+            self.assertIsNone(task['error'])
+            self.assertEqual(task['waiting_details']['error_code'], 'resident_storage_quota_exceeded')
+            self.assertGreater(task['retry_at'], time.time())
+            self.assertEqual(q.get(second['id'])['waiting_details']['blocked_by'], first['id'])
+            self.assertFalse(q.reserved)
+            self.assertEqual(q.db.execute('SELECT count(*) FROM cooldowns').fetchone()[0], 0)
+            self.assertFalse((self.backend.root / 'jobs' / first['id']).exists())
+            # Increasing capacity and reaching the retry time resumes the same
+            # tickets; no resubmission or new IDs, and both ports can execute.
+            self.backend.max_storage = 1073741824
+            with q.db:
+                q.db.execute('UPDATE jobs SET retry_at=? WHERE id=?', (time.time() - 1, first['id']))
+            q.dispatch_once()
+            self.assertEqual([q.get(t['id'])['fpga'] for t in (first, second)], [4, 5])
+            for worker in list(q.workers):
+                worker.join(5)
+            for payload in (first, second):
+                task = q.get(payload['id'])
+                self.assertEqual(task['state'], 'completed', task)
+                self.assertNotIn('waiting_details', task)
+            self.assertFalse(self.backend.storage_reserved)
+        finally:
+            q.close()
+
+    def test_materialized_files_are_not_reserved_twice_and_admission_is_atomic(self):
+        tasks = [self.task(i) for i in (1, 2, 3)]
+        self.backend.reserve_storage(tasks[0], self.images.path(tasks[0]['id']))
+        budget = self.backend.storage_reserved[tasks[0]['id']]
+        directory = self.backend.root / 'jobs' / tasks[0]['id']
+        directory.mkdir(parents=True)
+        for name in ('image.bin', 'readback.bin'):
+            with (directory / name).open('wb') as handle:
+                handle.truncate(1048576)
+        self.backend.max_storage = 4 * budget  # Exactly two peak budgets.
+        barrier = threading.Barrier(2)
+        admitted, rejected = [], []
+        def reserve(task):
+            barrier.wait()
+            try:
+                self.backend.reserve_storage(task, self.images.path(task['id']))
+                admitted.append(task['id'])
+            except StorageQuotaExceeded as error:
+                rejected.append(error.details)
+        threads = [threading.Thread(target=reserve, args=(task,)) for task in tasks[1:]]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(2)
+        self.assertEqual(len(admitted), 1)
+        self.assertEqual(len(rejected), 1)
+        metrics = rejected[0]
+        self.assertEqual(metrics['used_bytes'], 2 * 1048576)
+        self.assertEqual(metrics['used_bytes'] + metrics['reserved_bytes'], metrics['limit_bytes'])
+        self.assertEqual(metrics['requested_bytes'], budget)
+        self.assertEqual(len(self.backend.storage_reserved), 2)
+
+    def test_filesystem_shortage_has_distinct_diagnostics(self):
+        task = self.task(1)
+        usage = shutil.disk_usage(self.backend.root)
+        with patch('fpga_scheduler.backends.resident.shutil.disk_usage', return_value=usage._replace(free=1)):
+            with self.assertRaises(StorageQuotaExceeded) as caught:
+                self.backend.reserve_storage(task, self.images.path(task['id']))
+        details = caught.exception.details
+        self.assertEqual(details['error_code'], 'filesystem_space_exhausted')
+        self.assertEqual(details['disk_free_bytes'], 1)
+        self.assertGreater(details['required_free_bytes'], 1)
+        self.assertFalse(self.backend.storage_reserved)
+
+    def test_repeated_safe_jobs_reclaim_load_files_at_capacity_boundary(self):
+        payload = self.task(1)
+        self.backend.reserve_storage(payload, self.images.path(payload['id']))
+        budget = self.backend.storage_reserved[payload['id']]
+        self.backend.release_prepared(payload['id'])
+        self.ready()
+        self.backend.max_storage = 2 * (budget + 524288)
+        epoch = self.backend.sessions[4].epoch
+        for i in range(1, 13):
+            payload = payload if i == 1 else self.task(i)
+            result = self.run_task(payload)
+            self.assertEqual(result['exit_code'], 0, result)
+            directory = self.backend.root / 'jobs' / payload['id']
+            self.assertFalse((directory / 'image.bin').exists())
+            self.assertFalse((directory / 'readback.bin').exists())
+            for name in ('uart.raw.log', 'start-intent.json', 'result.json'):
+                self.assertTrue((directory / name).exists())
+            self.assertTrue(self.images.path(payload['id']).exists())
+            self.assertEqual(result['details']['session'], epoch)
+        self.assertEqual(self.backend.sessions[4].downloads, 1)
+        self.assertLess(self.backend.storage_status()['used_bytes'], 524288)
+
+    def test_upgrade_prunes_only_safe_load_copies_and_keeps_artifacts_and_recovery(self):
+        self.backend.keep_load_files = True
+        self.ready()
+        payload = self.task(1)
+        result = self.run_task(payload)
+        directory = self.backend.root / 'jobs' / payload['id']
+        self.assertTrue((directory / 'image.bin').exists())
+        self.assertTrue((directory / 'readback.bin').exists())
+        artifacts = directory / 'artifacts'
+        artifacts.mkdir()
+        (artifacts / 'C.bin').write_bytes(b'output to retain')
+        retained = {p: p.read_bytes() for p in directory.rglob('*')
+                    if p.is_file() and p.name not in ('image.bin', 'readback.bin')}
+        old = time.time() - 8 * 86400
+        os.utime(directory, (old, old))
+        protected = []
+        for i in (2, 3, 4):
+            task = self.task(i)
+            work = self.backend.root / 'jobs' / task['id']
+            work.mkdir(parents=True)
+            (work / 'image.bin').write_bytes(b'keep')
+            (work / 'readback.bin').write_bytes(b'keep')
+            if i != 2:  # i=2 has no reliable terminal result.
+                value = dict(result, details=dict(reset_confirmed=i == 4, ddr_readback_matches=i == 3))
+                atomic_json(work / 'result.json', dict(id=task['id'], sha256=task['sha256'], result=value))
+            protected.extend((work / 'image.bin', work / 'readback.bin'))
+        self.backend.close()
+        self.backend = Resident((self.node,), self.root / 'state', hardware_project=self.project,
+                                lock_dir=self.root / 'locks')
+        self.assertFalse((directory / 'image.bin').exists())
+        self.assertFalse((directory / 'readback.bin').exists())
+        self.assertAlmostEqual(directory.stat().st_mtime, old, places=5)
+        for path, data in retained.items():
+            self.assertEqual(path.read_bytes(), data)
+        self.assertTrue(all(p.read_bytes() == b'keep' for p in protected))
+        recovered = self.backend.recover(dict(id=payload['id'], payload=json.dumps(payload), node='local', fpga=4))
+        self.assertEqual(recovered, result)
 
 
 class LogTests(unittest.TestCase):
@@ -670,10 +858,16 @@ class RecoveryAndQuotaTests(unittest.TestCase):
             self.assertEqual(load(path).resident['shared_clock_index'], 0)
             path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=true'))
             self.assertTrue(load(path).resident['explicit_allocation'])
+            path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nkeep_load_files=true\nstorage_retry_seconds=0.5'))
+            self.assertTrue(load(path).resident['keep_load_files'])
+            self.assertEqual(load(path).resident['storage_retry_seconds'], .5)
             for bad in (base + 'ssh_host="remote"\n', base.replace('ports=[4,5]', 'ports=[4,4]'),
                         base.replace('hardware_project="project"', 'profile="dma"\nhardware_project="project"'),
                         base.replace('lock_dir="locks"', 'lock_dir="locks"\nrecovery_attempts=1.5'),
                         base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=1'),
+                        base.replace('lock_dir="locks"', 'lock_dir="locks"\nkeep_load_files=1'),
+                        *(base.replace('lock_dir="locks"', 'lock_dir="locks"\nstorage_retry_seconds=' + value)
+                          for value in ('0', '-1', 'true')),
                         *(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=' + value)
                           for value in ('-1', '24', 'true', '6.0'))):
                 path.write_text(bad)
