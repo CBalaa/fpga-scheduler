@@ -16,8 +16,11 @@ import time
 
 def submit_process(endpoint, token_file, image):
     from fpga_scheduler import Client
-    # This process exits immediately after durable submission.
-    return Client(endpoint, token_file=token_file).submit(image, timeout=120).id
+    # Each process owns its task lease until the task has actually retired.
+    with Client(endpoint, token_file=token_file) as client:
+        task = client.submit(image, timeout=120)
+        client.wait(task.id, timeout=600, poll_interval=.1)
+        return task.id
 
 
 def main():
@@ -67,8 +70,7 @@ def main():
                 raise RuntimeError('A/B/A did not exercise both ports')
     counts = Counter()
     while min((counts[p] for p in ports), default=0) < args.count_per_port:
-        # More independent clients than available slots, including durable
-        # jobs whose submitting process has already retired.
+        # More independent submitting processes than available slots.
         with ProcessPoolExecutor(max_workers=6) as pool:
             ids = list(pool.map(submit_process, [args.endpoint] * 6, [args.token_file] * 6, [str(args.hello)] * 6))
         (args.output / 'latest-submitted.json').write_text(json.dumps(ids))

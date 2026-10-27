@@ -1,5 +1,6 @@
 """Durable FIFO adapted from buddy-caas fpga_jobs.py (see NOTICE)."""
 from concurrent.futures import ThreadPoolExecutor
+import base64
 import json
 import logging
 import math
@@ -8,13 +9,15 @@ import sqlite3
 import threading
 import time
 
-from .models import ACTIVE, STATES, BUSY_EXIT, BUSY_TOKEN, Conflict, task_id, validate
+from .models import (ACTIVE, STATES, BUSY_EXIT, BUSY_TOKEN, Cancellation,
+                     CancelledError, Conflict, cancelled_result, task_id, validate)
 
 LOG = logging.getLogger(__name__)
 
 
 class JobQueue:
-    def __init__(self, path, backend, images, *, interval=3, capacity=256, cooldown=60, retention=7 * 86400):
+    def __init__(self, path, backend, images, *, interval=3, capacity=256, cooldown=60, retention=7 * 86400,
+                 client_heartbeat_seconds=2, client_lease_seconds=15):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.backend, self.images = backend, images
         self.nodes = tuple(n.id for n in backend.nodes)
@@ -31,6 +34,9 @@ class JobQueue:
         self.interval, self.capacity, self.cooldown, self.retention = interval, capacity, cooldown, retention
         self.wake, self.stopping = threading.Event(), threading.Event()
         self.reserved, self.workers = set(), set()
+        self.controls = {}
+        self.heartbeat_seconds, self.lease_seconds = client_heartbeat_seconds, client_lease_seconds
+        self.lease_monitor = None
         self.next_node, self.next_cleanup = 0, 0
         self.ports, self.node_errors = [], {}
         self.status_error = None
@@ -43,26 +49,39 @@ class JobQueue:
                 payload TEXT NOT NULL, state TEXT NOT NULL, created REAL NOT NULL,
                 started REAL, finished REAL, node TEXT, fpga INTEGER, result TEXT, error TEXT)''')
             self.db.execute('CREATE INDEX IF NOT EXISTS jobs_state_seq ON jobs(state,seq)')
+            columns = {row[1] for row in self.db.execute('PRAGMA table_info(jobs)')}
+            for name in ('session_id', 'cancel_reason'):
+                if name not in columns:
+                    self.db.execute(f'ALTER TABLE jobs ADD COLUMN {name} TEXT')
+            self.db.execute('CREATE INDEX IF NOT EXISTS jobs_session ON jobs(session_id,state)')
+            self.db.execute('''CREATE TABLE IF NOT EXISTS client_sessions (
+                id TEXT PRIMARY KEY, heartbeat REAL NOT NULL, lease_seconds REAL NOT NULL,
+                heartbeat_seconds REAL NOT NULL, state TEXT NOT NULL)''')
             self.db.execute('''CREATE TABLE IF NOT EXISTS cooldowns (
                 node TEXT NOT NULL, fpga INTEGER NOT NULL, until REAL NOT NULL, PRIMARY KEY(node,fpga))''')
-            for row in self.db.execute("SELECT * FROM jobs WHERE state='running'").fetchall():
+            for row in self.db.execute("SELECT * FROM jobs WHERE state IN ('running','cancelling')").fetchall():
                 result = backend.recover(dict(row)) if hasattr(backend, 'recover') else None
                 self.db.execute("UPDATE jobs SET state=?,finished=?,result=?,error=? WHERE id=?",
-                                ('completed' if result and result['exit_code'] == 0 else 'failed',
+                                (self._result_state(result) if result else 'failed',
                                  time.time(), json.dumps(result) if result else None,
                                  None if result else 'Service restarted; execution outcome unknown; not replayed', row['id']))
+            self._expire_sessions_locked(time.time())
 
     def start(self):
         if self.dispatcher is not None:
             raise RuntimeError('Dispatcher already started')
         self.dispatcher = threading.Thread(target=self.loop, name='fpga-dispatcher', daemon=True)
         self.dispatcher.start()
+        self.lease_monitor = threading.Thread(target=self._lease_loop, name='fpga-client-leases', daemon=True)
+        self.lease_monitor.start()
 
     def close(self):
         self.stopping.set()
         self.wake.set()
         if self.dispatcher:
             self.dispatcher.join()
+        if self.lease_monitor:
+            self.lease_monitor.join()
         # Backends have bounded transport/execution timeouts. Keep DB and the
         # service's state-directory lock alive until every assignment retires.
         with self.dispatch_lock:
@@ -79,22 +98,105 @@ class JobQueue:
                     self.db.close()
                     self.closed = True
 
-    def submit(self, payload):
+    def open_session(self, ident, options):
+        task_id(ident)
+        if not getattr(self.backend, 'supports_cancellation', False):
+            raise Conflict('This backend does not support client leases / running cancellation; use bosc-resident or simulator')
+        if not isinstance(options, dict) or set(options) - {'heartbeat_seconds', 'lease_seconds'}:
+            raise ValueError('Invalid client session options')
+        heartbeat = options.get('heartbeat_seconds', self.heartbeat_seconds)
+        lease = options.get('lease_seconds', self.lease_seconds)
+        if any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+               or not .01 <= v <= 3600 for v in (heartbeat, lease)) or heartbeat >= lease:
+            raise ValueError('Require 0.01 <= heartbeat_seconds < lease_seconds <= 3600')
+        with self.lock, self.db:
+            if self.stopping.is_set():
+                raise RuntimeError('Service is stopping')
+            self._expire_sessions_locked(time.time())
+            self.db.commit()
+            row = self.db.execute('SELECT * FROM client_sessions WHERE id=?', (ident,)).fetchone()
+            if row:
+                if row['state'] != 'active':
+                    raise Conflict('Client session has ended; create a new Client')
+            else:
+                self.db.execute('INSERT INTO client_sessions VALUES (?,?,?,?,?)',
+                                (ident, time.time(), lease, heartbeat, 'active'))
+                row = self.db.execute('SELECT * FROM client_sessions WHERE id=?', (ident,)).fetchone()
+            return dict(id=ident, heartbeat_seconds=row['heartbeat_seconds'], lease_seconds=row['lease_seconds'])
+
+    def heartbeat(self, ident):
+        task_id(ident)
+        with self.lock, self.db:
+            self._require_session_locked(ident)
+            self.db.execute('UPDATE client_sessions SET heartbeat=? WHERE id=?', (time.time(), ident))
+        return dict(id=ident, state='active')
+
+    def close_session(self, ident):
+        task_id(ident)
+        with self.lock, self.db:
+            row = self.db.execute('SELECT * FROM client_sessions WHERE id=?', (ident,)).fetchone()
+            if row is None:
+                raise KeyError(ident)
+            if row['state'] == 'active':
+                self._end_session_locked(ident, 'closed', 'Submitting client closed')
+        self.wake.set()
+        return dict(id=ident, state='closed')
+
+    def _require_session_locked(self, ident):
+        self._expire_sessions_locked(time.time())
+        # Expiration is irreversible even if this late heartbeat / submit is
+        # rejected and its surrounding transaction rolls back.
+        self.db.commit()
+        row = self.db.execute('SELECT state FROM client_sessions WHERE id=?', (ident,)).fetchone()
+        if row is None or row['state'] != 'active':
+            raise Conflict('Client session missing, closed or expired; tasks cannot be revived')
+
+    def _end_session_locked(self, ident, state, reason):
+        self.db.execute('UPDATE client_sessions SET state=? WHERE id=?', (state, ident))
+        for row in self.db.execute("SELECT id FROM jobs WHERE session_id=? AND state IN ('queued','running','cancelling')",
+                                   (ident,)).fetchall():
+            self._cancel_locked(row['id'], reason)
+
+    def _expire_sessions_locked(self, now):
+        expired = self.db.execute("SELECT id FROM client_sessions WHERE state='active' AND heartbeat+lease_seconds<=?",
+                                  (now,)).fetchall()
+        for row in expired:
+            self._end_session_locked(row['id'], 'expired', 'Submitting client lease expired')
+        return bool(expired)
+
+    def expire_sessions(self):
+        with self.lock, self.db:
+            expired = self._expire_sessions_locked(time.time())
+        if expired:
+            self.wake.set()
+
+    def _lease_loop(self):
+        # Independent of inventory / initialization, which may block for minutes.
+        while not self.stopping.wait(.05):
+            try:
+                self.expire_sessions()
+            except Exception:
+                LOG.exception('Client lease pass failed')
+
+    def submit(self, payload, session_id=None):
         payload = validate(payload)
         with self.lock, self.db:
             if self.stopping.is_set():
                 raise RuntimeError('Service is stopping')
-            previous = self.db.execute('SELECT payload FROM jobs WHERE id=?', (payload['id'],)).fetchone()
+            if session_id is not None:
+                task_id(session_id)
+                self._require_session_locked(session_id)
+            previous = self.db.execute('SELECT payload,session_id FROM jobs WHERE id=?', (payload['id'],)).fetchone()
             if previous:
-                if json.loads(previous['payload']) != payload:
+                if json.loads(previous['payload']) != payload or previous['session_id'] != session_id:
                     raise Conflict('Task ID already belongs to different inputs')
             else:
-                count = self.db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','running')").fetchone()[0]
+                count = self.db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','running','cancelling')").fetchone()[0]
                 if count >= self.capacity:
                     raise OverflowError('Queue is full')
                 self.images.freeze(payload['id'], payload['sha256'])
-                self.db.execute('INSERT INTO jobs(id,payload,state,created) VALUES (?,?,?,?)',
-                                (payload['id'], json.dumps(payload), 'queued', time.time()))
+                self.db.execute('INSERT INTO jobs(id,payload,state,created,session_id) VALUES (?,?,?,?,?)',
+                                (payload['id'], json.dumps(payload), 'queued', time.time(), session_id))
             task = self.get(payload['id'])
         self.wake.set()
         return task
@@ -113,6 +215,31 @@ class JobQueue:
                 data['waiting_reason'] = self.status_error or 'Waiting for an available FPGA'
             return data
 
+    def output(self, ident, offset=0, limit=65536):
+        """Read one bounded UART chunk without holding a hardware/session lock."""
+        if type(offset) is not int or offset < 0:
+            raise ValueError('Output offset must be a nonnegative byte count')
+        if type(limit) is not int or not 1 <= limit <= 65536:
+            raise ValueError('Output limit must be within 1..65536 bytes')
+        task = self.get(ident)
+        reader = getattr(self.backend, 'read_output', None)
+        data = reader(ident, offset, limit + 1) if reader else None
+        if data is None:
+            # Compatibility backends publish output only at completion.
+            result = task.get('result') or {}
+            text = result.get('uart_output')
+            text = result.get('output', '') if text is None else text
+            raw = text.encode('utf-8')
+            if offset > len(raw):
+                raise ValueError('Output offset exceeds available bytes')
+            data = raw[offset:offset + limit + 1]
+        done = task['state'] not in ACTIVE and len(data) <= limit
+        data = data[:limit]
+        if not done:
+            task.pop('result', None)
+        return dict(id=ident, offset=offset, next_offset=offset + len(data),
+                    data=base64.b64encode(data).decode('ascii'), done=done, task=task)
+
     def list(self, states=ACTIVE, limit=100, offset=0):
         if (not states or any(s not in STATES for s in states) or type(limit) is not int
                 or not 1 <= limit <= 256 or type(offset) is not int or offset < 0):
@@ -126,14 +253,22 @@ class JobQueue:
 
     def cancel(self, ident):
         with self.lock, self.db:
-            row = self.get(ident)
-            if row['state'] == 'running':
-                raise Conflict('Running tasks cannot be cancelled')
-            if row['state'] == 'queued':
-                self.db.execute("UPDATE jobs SET state='cancelled',finished=? WHERE id=?", (time.time(), ident))
+            self._cancel_locked(ident, 'Cancellation requested')
             result = self.get(ident)
         self.wake.set()
         return result
+
+    def _cancel_locked(self, ident, reason):
+        row = self.get(ident)
+        if row['state'] == 'queued':
+            self.db.execute("UPDATE jobs SET state='cancelled',finished=?,cancel_reason=?,result=? WHERE id=?",
+                            (time.time(), reason, json.dumps(cancelled_result(reason)), ident))
+        elif row['state'] == 'running':
+            control = self.controls.get(ident)
+            if control is None or not getattr(self.backend, 'supports_cancellation', False):
+                raise Conflict('Backend cannot safely cancel a running task')
+            if control.request(reason):
+                self.db.execute("UPDATE jobs SET state='cancelling',cancel_reason=? WHERE id=?", (reason, ident))
 
     def inventory(self):
         def probe(node):
@@ -178,6 +313,7 @@ class JobQueue:
         do_cleanup = False
         with self.lock, self.db:
             now = time.time()
+            self._expire_sessions_locked(now)
             if now >= self.next_cleanup:
                 # Protect all retained jobs, including recent terminal jobs, so
                 # input retention is never shorter than task-record retention.
@@ -208,6 +344,8 @@ class JobQueue:
             order = self.nodes[self.next_node:] + self.nodes[:self.next_node]
             free = [by_node[n][i] for i in range(max(map(len, by_node.values()), default=0)) for n in order if i < len(by_node[n])]
             for job, (node, port) in zip(waiting, free):
+                if job['session_id'] is not None:
+                    self._expire_sessions_locked(time.time())
                 if time.time() - job['created'] >= json.loads(job['payload'])['queue_timeout']:
                     self._expire(job['id'])
                     continue
@@ -217,7 +355,9 @@ class JobQueue:
                     continue
                 self.next_node = (self.nodes.index(node) + 1) % len(self.nodes)
                 self.reserved.add((node, port))
-                worker = threading.Thread(target=self.execute, args=(job, node, port), name='fpga-' + job['id'])
+                control = Cancellation()
+                self.controls[job['id']] = control
+                worker = threading.Thread(target=self.execute, args=(job, node, port, control), name='fpga-' + job['id'])
                 self.workers.add(worker)
                 self.db.commit()
                 try:
@@ -226,6 +366,7 @@ class JobQueue:
                     # No backend call took place; retain this ticket for a later pass.
                     self.reserved.discard((node, port))
                     self.workers.discard(worker)
+                    self.controls.pop(job['id'], None)
                     self.db.execute("UPDATE jobs SET state='queued',node=NULL,fpga=NULL,started=NULL WHERE id=?",
                                     (job['id'],))
                     self.db.commit()
@@ -241,14 +382,28 @@ class JobQueue:
         self.db.execute("UPDATE jobs SET state='failed',finished=?,error=? WHERE id=? AND state='queued'",
                         (time.time(), 'Queue timeout; hardware was not started', ident))
 
-    def execute(self, job, node, port):
+    @staticmethod
+    def _result_state(result):
+        if result.get('execution_status') == 'cancelled':
+            return 'cancelled'
+        return 'completed' if result['exit_code'] == 0 else 'failed'
+
+    def execute(self, job, node, port, control):
         payload = json.loads(job['payload'])
         result, error, state, launched = None, None, 'failed', False
         try:
+            control.check()
             image = self.images.freeze(payload['id'], payload['sha256'])
-            self.backend.prepare(payload, node, image)
-            launched = True
-            result = self.backend.run(payload, node, port)
+            if getattr(self.backend, 'supports_cancellation', False):
+                self.backend.prepare(payload, node, image, cancellation=control)
+                control.check()
+                launched = True
+                result = self.backend.run(payload, node, port, cancellation=control)
+            else:
+                self.backend.prepare(payload, node, image)
+                control.check()
+                launched = True
+                result = self.backend.run(payload, node, port)
             if result.get('error'):
                 error = 'Execution connection lost; outcome unknown; not replayed'
                 result = None
@@ -260,14 +415,24 @@ class JobQueue:
                         or not math.isfinite(result['seconds']) or result['seconds'] < 0):
                     raise ValueError('Invalid execution result')
                 result['node'] = node
-                state = 'completed' if result['exit_code'] == 0 else 'failed'
+                state = self._result_state(result)
+        except CancelledError as exc:
+            result = cancelled_result(str(exc), node=node)
+            state = 'cancelled'
         except Exception:
             error = ('Execution connection lost; outcome unknown; not replayed' if launched else
                      'Input transfer or verification failed; hardware was not started')
             result = None
             LOG.exception('Task %s failed', job['id'])
+            if not launched and control.reason:
+                result, error, state = cancelled_result(control.reason, node=node), None, 'cancelled'
         finally:
+            if hasattr(self.backend, 'release_prepared'):
+                self.backend.release_prepared(payload['id'])
             with self.lock, self.db:
+                reason = control.finish()
+                if state == 'queued' and reason:
+                    result, state = cancelled_result(reason, node=node), 'cancelled'
                 self.db.execute('''UPDATE jobs SET state=?,result=?,error=?,finished=?,fpga=?,node=?,
                     started=CASE WHEN ? THEN NULL ELSE started END WHERE id=?''',
                     (state, json.dumps(result) if result else None, error,
@@ -275,9 +440,12 @@ class JobQueue:
                      None if state == 'queued' else node, state == 'queued', job['id']))
                 self.db.commit()
                 self.reserved.discard((node, port))
-                if state == 'failed':
+                clean_abort = (result and result.get('execution_status') in ('timeout', 'cancelled')
+                               and result.get('details', {}).get('reset_confirmed') is True)
+                if state == 'failed' and not clean_abort:
                     self.db.execute('INSERT OR REPLACE INTO cooldowns VALUES (?,?,?)', (node, port, time.time() + self.cooldown))
                 self.workers.discard(threading.current_thread())
+                self.controls.pop(job['id'], None)
             self.wake.set()
 
     def loop(self):

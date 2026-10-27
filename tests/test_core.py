@@ -102,15 +102,15 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.images.put(task['id'], b'changed')
 
-    def test_cancel_queued_and_reject_running(self):
+    def test_cancel_queued_and_running(self):
         self.submit(1)
         self.q.cancel(f'{1:032x}')
         self.assertEqual(self.q.get(f'{1:032x}')['state'], 'cancelled')
         self.submit(2)
         self.q.dispatch_once()
-        with self.assertRaises(Conflict):
-            self.q.cancel(f'{2:032x}')
+        self.q.cancel(f'{2:032x}')
         self.finish()
+        self.assertEqual(self.q.get(f'{2:032x}')['state'], 'cancelled')
 
     def test_capacity_excludes_terminal_tasks(self):
         self.q.capacity = 2
@@ -128,7 +128,7 @@ class QueueTests(unittest.TestCase):
         first = self.submit(1)
         self.submit(2)
         original = self.backend.run
-        self.backend.run = lambda *a: dict(exit_code=75, output=BUSY_TOKEN, node='a', seconds=0)
+        self.backend.run = lambda *a, **kw: dict(exit_code=75, output=BUSY_TOKEN, node='a', seconds=0)
         self.q.dispatch_once()
         self.finish()
         self.assertEqual(self.q.get(first['id'])['position'], 1)
@@ -139,7 +139,7 @@ class QueueTests(unittest.TestCase):
         self.assertEqual(self.q.get(first['id'])['state'], 'completed')
 
     def test_exit_75_without_exact_marker_is_not_replayed(self):
-        self.backend.run = lambda *a: dict(exit_code=75, output='Program started\n' + BUSY_TOKEN, node='a', seconds=0)
+        self.backend.run = lambda *a, **kw: dict(exit_code=75, output='Program started\n' + BUSY_TOKEN, node='a', seconds=0)
         self.submit(1)
         self.q.dispatch_once()
         self.finish()
@@ -296,6 +296,10 @@ class InputTests(unittest.TestCase):
             self.assertEqual(cfg.nodes[0].ports, (4, 5))
             for text in (base.replace('[4,5]', '[4,4]'), base.replace('[4,5]', '[true]'),
                          'port=true\n' + base, 'oops=1\n' + base,
+                         'client_heartbeat_seconds=0\n' + base,
+                         'client_heartbeat_seconds=0.001\n' + base,
+                         'client_lease_seconds=4000\n' + base,
+                         'client_heartbeat_seconds=20\n' + base,
                          base + '[[nodes]]\nid="a"\nports=[1]\n'):
                 path.write_text(text)
                 with self.assertRaises(ValueError):
@@ -309,7 +313,7 @@ class FailureBoundaryTests(unittest.TestCase):
     finish = QueueTests.finish
 
     def test_error_only_response_has_no_partial_result(self):
-        self.backend.run = lambda *args: dict(error='ssh')
+        self.backend.run = lambda *args, **kwargs: dict(error='ssh')
         task = self.submit(1)
         self.q.dispatch_once()
         self.finish()
@@ -319,7 +323,7 @@ class FailureBoundaryTests(unittest.TestCase):
         self.assertIn('unknown', result['error'])
 
     def test_nonfinite_result_is_failed_and_remains_queryable(self):
-        self.backend.run = lambda *args: dict(exit_code=0, output='invalid', seconds=float('nan'))
+        self.backend.run = lambda *args, **kwargs: dict(exit_code=0, output='invalid', seconds=float('nan'))
         task = self.submit(1)
         with self.assertLogs('fpga_scheduler.queue', level='ERROR'):
             self.q.dispatch_once()

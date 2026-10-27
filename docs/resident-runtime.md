@@ -8,9 +8,14 @@
 ## 安装与启动
 
 先排空并正常停止旧入口；所有能操作同一端口的部署使用相同 lock_dir。
-仍检查实际 UVHS owner/booked、UART 占用与 TIOCEXCL，遇到外部会话等待，不抢占。
-白名单修改必须用旧配置正常停止后进行。共享板级初始化和恢复等待同板受管任务 drain，
-不受管会话存在时不执行共享操作。这里只管理白名单内端口。
+仍检查目标端口的 UVHS owner/booked、UART 占用与 TIOCEXCL，被占用时等待，不抢占。
+白名单修改必须用旧配置正常停止后进行。初始化与恢复不因同板其他 FPGA 有会话而直接阻塞：
+先只读查询物理时钟，`shared_clock_index`（默认 6，须与硬件工程 sys_clk 的映射一致）
+为 5.5296 MHz 时复用现有时钟，跳过 `config -clock` 和 commit，仅初始化白名单内空闲端口。
+时钟不一致或无法确认且同板仍有其他会话时保持 RECOVERING，不重配共享时钟；
+同板无其他会话时才允许设置时钟。板级锁仍串行化初始化，不要求运行任务排空。
+每次新建 UVHS 会话都刷新独立工作目录的 `hw.dat` 链接，使用配置工程当前指向的版本。
+切换工程版本后需正常停止并重新启动 daemon；已有会话不会在任务之间自动切换 bitstream。
 
 远端系统 Python 3.8 不满足要求。管理员选用与目标 glibc 兼容的 Python 3.11+ 独立发行包，
 从可信发布者 HTTPS 清单独立取得 SHA256，再安装到新目录；不修改系统 Python 或厂商安装。
@@ -65,12 +70,19 @@ SDK 读取用户自己的 bin 并上传内容，daemon 不访问其私有目录�
 ~~~python
 from fpga_scheduler import Client
 client = Client("http://127.0.0.1:8765", token_file="client.token")
-result = client.run_test("hello.bin", timeout=120)
-print(result.uart_output)
+with client.run_test("hello.bin", timeout=120) as stream:
+    for chunk in stream:
+        print(chunk, end="", flush=True)
+    result = stream.result
 print(result.execution_status, result.app_exit_code, result.ok)
 task = client.submit("hello.bin", timeout=120)
-print(task.id)  # 保存后可以直接退出，之后 job/wait 查询
+print(task.id)
+finished = client.wait(task.id)  # 提交进程必须继续存活，退出会取消未结束任务
+client.close()
 ~~~
+
+run_test 默认返回可迭代的输出流；同步获取 Result 可用 `stream=False`，
+配合 `show=True` 自动实时打印 UART，`show=False` 静默等待。
 
 一条命令运行与多进程示例见 [run.py](../examples/resident/run.py)：
 
@@ -80,8 +92,15 @@ python examples/resident/run.py hello.bin --token-file client.token --mode submi
 python examples/resident/run.py hello.bin --token-file client.token --mode multiprocess
 ~~~
 
-所有客户端共用权限。客户端退出、Ctrl-C、等待超时或断连不取消任务；cancel 只取消 queued。
-服务独立执行期限。无运行中取消、个人权限或裸机内存隔离，仅面向受信任团队。
+所有客户端共用权限，但各 Client 具有独立租约。客户端正常退出、Ctrl+C、未捕获异常退出
+尽量主动关闭会话并取消全部未结束任务；崩溃、SIGKILL、断网由租约兜底，默认每 2 秒心跳、
+15 秒失联取消。后台 daemon 心跳线程独立于输出读取，不阻止 Python 退出；关闭流或等待超时
+本身不取消。服务配置 client_heartbeat_seconds / client_lease_seconds 或 SDK 同名去掉 client_ 前缀
+的参数可调整。其他客户端查询、读取输出不会续租。没有 detached 模式。
+排队取消不操作硬件；运行取消先进入 cancelling，worker 串行收尾后才完成并释放槽位。
+CLI 使用 fpga-scheduler run hello.bin --timeout 120 保持前台，Ctrl+C 取消；submit 命令是前台同义命令。
+服务独立执行期限；正常 daemon stop 仍 drain，不因停止服务而主动取消任务。
+无个人权限或裸机内存隔离，仅面向受信任团队。
 
 ## 执行与恢复
 
@@ -92,7 +111,12 @@ python examples/resident/run.py hello.bin --token-file client.token --mode multi
 每任务保留 1 MiB 补齐、DDR 64 字节元素写入/读回逐字节比较、入口 0x80000000、
 rv64gc/lp64d、5.5296 MHz / 115200 UART。释放 CPU 前 fsync start intent，
 收尾复位、UART 静默边界确认后原子保存结果，再释放执行槽。普通 PASS 不表示任务成功。
-正常退出（含非零应用码）保留会话；trap/timeout/平台/协议故障等待同板安全条件后重建。
+正常退出（含非零应用码）保留会话。取消/超时在 CPU 复位读回及 UART 清理均成功后
+同样保留 UVHS PID/session、回到 READY，不重新 download/initialize、不进入失败冷却。
+取消/超时期间控制通道或收尾失败则 QUARANTINED，记录原因，不自动完整重建。
+装载取消等待当前 writemem/readmem 确认结束后收尾；等待受 command_timeout 约束。
+UVHS 命令没有确认时不再并发发送 reset，按平台失败隔离，禁止释放 CPU 和写入下一任务。
+其余 trap/平台/协议故障按同一共享时钟检查重建目标端口，不等待同频的其他 FPGA 空闲。
 重试有上限和指数退避，最终隔离至管理员停服检查。应用返回 0 而收尾失败仍 ok=False。
 
 UART v1 沿用现有 hello；复位期间排空旧字节，每任务独立解析器，拒绝重复 START/终态等。
@@ -100,8 +124,10 @@ UART v1 沿用现有 hello；复位期间排空旧字节，每任务独立解析
 DMA/E6 连续复用未开放，服务不能从原始 bin 自动判别是否使用 DMA，只接受团队认可的 NH 程序。
 
 重启先核对 PID+启动时刻、回收已登记旧执行者，再允许初始化调度。
-running 有匹配 id/hash/node/port 的可靠终态则恢复，否则 failed/outcome unknown，不自动重放；
-queued 按原序继续。SQLite WAL+FULL，状态目录单实例；端口 flock 覆盖 session 并由 UVHS 子进程继承。
+running/cancelling 有匹配 id/hash/node/port 的可靠终态则恢复，否则 failed/outcome unknown，不自动重放；
+会话租约持久化，queued 在原会话仍有效时按原序继续，过期则取消；晚到心跳不复活任务。
+旧版本遗留的无会话 queued 仍按原顺序恢复；新 HTTP 提交不允许无会话。
+SQLite WAL+FULL，状态目录单实例；端口 flock 覆盖 session 并由 UVHS 子进程继承。
 启动到登记之间的极小崩溃窗口保守保持实际占用，不抢占无法归属的进程。
 物理执行与主机持久化不能提供严格 exactly-once。
 
@@ -122,6 +148,12 @@ session 不变，download/initialize 各一次，DDR 读回、UART PASS、exit=0
 故障、supervisor 和最终停止证据见忽略的 build/resident-acceptance/ 汇总。
 未在 fpga113、第二 Linux 账号或 DMA/E6 镜像上验收。源码及配置示例不提交机器路径、凭据或原始日志。
 
-真机额外验证 exit7/trap/hang 的失败语义、超时后复位与重建、再次 hello；
+以下是旧版恢复策略的历史真机证据，不代表新取消/租约策略已经板测：
+真机曾额外验证 exit7/trap/hang 的失败语义、超时后复位与重建、再次 hello；
 supervisor 监护的 daemon 被 SIGKILL 后，两个有 start intent 的任务标记结果未知且未重放，
 queued 在正常停止/重启后完成。验收结束正常 stop，确认 supervisor/API 停止且 UART4/5 无占用。
+
+2026-10-27 新增租约、运行取消及 NH-only 超时复用的离线测试：模拟 UVHS、PTY UART、
+独立客户端正常/异常退出、Ctrl+C、SIGKILL、租约到期、双客户端隔离、装载取消及隔离路径。
+新策略仍需真机验证：复位和 UART 边界的可靠性、取消/超时后的同 PID/session 下一任务、
+控制故障隔离与同板其他任务不受影响。本次未部署、未执行 bin、未操作 FPGA。

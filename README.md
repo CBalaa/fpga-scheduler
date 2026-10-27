@@ -41,6 +41,8 @@ state_dir = "./state"
 token_file = "./service.token"
 bind = "127.0.0.1"
 port = 18765
+client_heartbeat_seconds = 2
+client_lease_seconds = 15
 
 [resident]
 profile = "nh-only"
@@ -54,7 +56,7 @@ uvhs_shell = "/path/to/vendor/bin/uvhs2_shell"
 TOML
 ~~~
 
-编辑其中三个绝对路径再启动。相对路径以 config 所在目录为基准；TOML 内不展开 `~` 或 `$HOME`。保存环境变量：
+编辑其中三个绝对路径再启动。相对路径以 config 所在目录为基准；TOML 内不展开 `~` 或 `$HOME`。同板其他 FPGA 可同时运行；服务复用已设置的 5.5296 MHz 时钟，时钟不一致且其他会话仍在使用时等待。`[resident] shared_clock_index` 默认 6，须与工程的 sys_clk 映射一致。保存环境变量：
 
 ~~~bash
 cat > "$FPGA_DEPLOY_DIR/env.sh" <<'SH'
@@ -69,6 +71,8 @@ SH
 fpga-scheduler daemon start
 fpga-scheduler daemon status
 fpga-scheduler health
+fpga-scheduler devices  # 端口状态、可用性和不可用原因
+fpga-scheduler jobs     # 排队、运行和取消中的任务
 # 正常停止：等待运行任务及硬件清理，保留排队任务
 fpga-scheduler daemon stop
 # 再次启动
@@ -76,6 +80,10 @@ fpga-scheduler daemon start
 ~~~
 
 新终端先执行 `. "$HOME/fpga-resident-deploy/env.sh"`，也可将它加入 `~/.bashrc`。`FPGA_SCHEDULER_CONFIG` 指定默认配置，显式 `--config` 优先。修改配置前先用原配置正常停止，再修改并启动。首次硬件初始化可能需要几分钟，期间状态查询可能超时，稍后重试。SSH 断开后服务继续运行，主机重启后需重新启动。
+
+CLI 默认显示状态摘要和表格；脚本读取原始数据时加上 `--json`，例如 `fpga-scheduler daemon status --json` 或 `fpga-scheduler jobs --json`。
+
+终端自动启用颜色：绿色表示正常，青色表示执行中，黄色表示等待/恢复/取消，红色表示失败/隔离。重定向和 JSON 默认不加颜色；可用 `--color always` 强制开启、`--color never` 或环境变量 `NO_COLOR=1` 关闭。
 
 ## 3. 通过 127.0.0.1 执行 bin
 
@@ -96,14 +104,13 @@ export FPGA_SCHEDULER_TOKEN_FILE="$HOME/client.token"
 
 ~~~bash
 export FPGA_BIN="/path/to/hello.bin"
-TASK_ID="$(fpga-scheduler --json submit "$FPGA_BIN" --timeout 120 | \
-  python -c 'import json, sys; print(json.load(sys.stdin)["id"])')"
-echo "$TASK_ID"
-fpga-scheduler wait "$TASK_ID" --timeout 4200
-# 后续查询：fpga-scheduler job "$TASK_ID"
+fpga-scheduler run "$FPGA_BIN" --timeout 120
+# 运行时打印任务 ID；另一个终端可查询或取消：
+# fpga-scheduler job <任务ID>
+# fpga-scheduler cancel <任务ID>
 ~~~
 
-`submit --timeout 120` 为执行期限，`wait --timeout 4200` 为客户端等待期限（含排队）。成功时 `state=completed`、`app_exit_code=0`、`exit_code=0`，UART 在 `result.uart_output` 中。
+`run --timeout 120` 为执行期限；命令保持前台心跳、实时打印 UART，Ctrl+C 取消。`submit` 命令现在也是前台执行，`--json run` 输出最终 JSON。成功时 `state=completed`、`app_exit_code=0`、`exit_code=0`。
 
 **Python：**保存为 `run_bin.py`（后面的局域网调用也使用此脚本）：
 
@@ -112,13 +119,15 @@ import os
 import sys
 from fpga_scheduler import Client
 
-client = Client(
+with Client(
     os.environ["FPGA_SCHEDULER_URL"],
     token_file=os.environ["FPGA_SCHEDULER_TOKEN_FILE"],
     request_timeout=360,
-)
-result = client.run_test(sys.argv[1], timeout=120, show=False)
-print(result.uart_output if result.uart_output is not None else result.output)
+) as client:
+    with client.run_test(sys.argv[1], timeout=120) as stream:
+        for chunk in stream:
+            print(chunk, end="", flush=True)
+        result = stream.result
 print(result.execution_status, result.app_exit_code, result.ok)
 raise SystemExit(0 if result.ok else 1)
 ~~~
@@ -127,7 +136,29 @@ raise SystemExit(0 if result.ok else 1)
 python run_bin.py "$FPGA_BIN"
 ~~~
 
-CLI 自动读取上述环境变量；Python 脚本通过 `os.environ` 显式传入。客户端退出、断连或等待超时不会取消已接收任务。
+`run_test()` 默认 `stream=True`，提交后返回流对象，由 `for` 持续读取输出；读完后从 `stream.result` 取得最终结果。需要同步等待并直接返回 `Result` 时，显式设置 `stream=False`：
+
+~~~python
+with Client("http://127.0.0.1:18765", token_file="client.token") as client:
+    result = client.run_test("hello.bin", timeout=120, stream=False, show=True)
+print(result.execution_status, result.app_exit_code, result.ok)
+~~~
+
+流模式下由调用者打印，`show` 不自动打印；同步模式下 `show=True` 自动实时打印，`show=False` 静默等待。文本块不一定是一整行。HTTP 默认每 0.2 秒增量读取 UART（可设 `poll_interval`），回环和局域网用法相同。升级需同时更新 daemon 与 SDK，再正常重启服务。Simulator 在任务结束时提供输出；旧 SSH 后端不支持新租约提交，会明确报错。
+
+CLI 自动读取上述环境变量；Python 脚本通过 `os.environ` 显式传入。**提交客户端退出即取消其未结束任务**：正常退出、Ctrl+C、未捕获异常尽量主动通知；崩溃、SIGKILL 或断网由租约到期兜底。默认每 2 秒心跳、15 秒失联取消；服务端配置如第 2 节，SDK 也可传 `heartbeat_seconds=2, lease_seconds=15`。心跳在后台自动运行，不依赖读取输出；关闭流或等待超时本身不取消，超过租约的断网会取消。其他客户端查询、读输出不会续租。
+
+`submit()` 只提交、不等待，适合同一进程批量提交；脚本必须继续运行并等待，直接退出会取消。`run_test()` 默认返回输出流；`Client.close()` 或退出 `with Client(...)` 会取消该 Client 的未结束任务。没有脱离客户端运行模式：
+
+~~~python
+with Client("http://127.0.0.1:18765", token_file="client.token") as client:
+    tasks = [client.submit(path, timeout=120) for path in ("a.bin", "b.bin")]
+    for task in tasks:
+        finished = client.wait(task.id)
+        print(task.id, finished.state, finished.result)
+~~~
+
+排队任务直接取消；已分配任务先显示 `cancelling`，由 worker 收尾后才结束并释放端口。NH-only 取消或超时在确认 CPU 复位、UART 清理成功后保留 UVHS PID/session，不重新 download/initialize、不冷却；收尾或控制通道失败则隔离端口，不自动重建。CPU 复位不能证明 DMA/E6 已停止，仍只接受团队认可的 NH-only 程序。
 
 ## 4. 通过局域网执行 bin
 
@@ -166,9 +197,7 @@ fpga-scheduler health
 
 ~~~bash
 export FPGA_BIN="/path/to/hello.bin"
-TASK_ID="$(fpga-scheduler --json submit "$FPGA_BIN" --timeout 120 | \
-  python -c 'import json, sys; print(json.load(sys.stdin)["id"])')"
-fpga-scheduler wait "$TASK_ID" --timeout 4200
+fpga-scheduler run "$FPGA_BIN" --timeout 120  # 保持前台；Ctrl+C 取消
 ~~~
 
 **Python**（将第 3 节的 `run_bin.py` 保存到客户端）：
@@ -193,6 +222,9 @@ fpga-scheduler daemon stop &&
 # rm -rf -- "$FPGA_BACKUP_DIR"
 ~~~
 
-仅在 stop 成功且 `supervisor_alive` 为 `false` 后卸载；失败时先排查。删除 `~/.bashrc` 中加载 `env.sh` 的语句，关闭当前终端。备份目录包含队列和日志，确认不再需要后再删除；不要删除共享锁目录、硬件工程或厂商工具。
+仅在 stop 成功且 status 显示 `Daemon: STOPPED` 后卸载；失败时先排查。删除 `~/.bashrc` 中加载 `env.sh` 的语句，关闭当前终端。备份目录包含队列和日志，确认不再需要后再删除；不要删除共享锁目录、硬件工程或厂商工具。
 
 更多选项见 [配置示例](configs/resident.example.toml)、[运维说明](docs/operations.md) 和 [API 文档](docs/api.md)。来源见 [NOTICE](NOTICE)，许可证见 [Apache-2.0](LICENSE)。
+
+
+本地开发的离线 FPGA 模拟测试见 [开发工具说明](docs/simulator.md)，无需 FPGA 服务器或硬件。

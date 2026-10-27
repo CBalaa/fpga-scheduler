@@ -148,6 +148,32 @@ class ResidentTests(unittest.TestCase):
             time.sleep(.02)
             self.ready()
 
+    def test_live_uart_output_available_before_timeout(self):
+        self.ready()
+        q = JobQueue(self.root / 'stream.db', self.backend, self.images, cooldown=0)
+        payload = self.task(1, 'hang')
+        payload['timeout'] = 1
+        try:
+            q.submit(payload)
+            q.dispatch_once()
+            deadline = time.monotonic() + .8
+            raw = b''
+            while time.monotonic() < deadline:
+                raw = self.backend.read_output(payload['id'], 0, 65536) or b''
+                if b'ordinary PASS' in raw:
+                    break
+                time.sleep(.005)
+            self.assertIn(b'ordinary PASS', raw)
+            self.assertEqual(q.get(payload['id'])['state'], 'running')
+            self.assertFalse(q.output(payload['id'])['done'])
+            for worker in list(q.workers):
+                worker.join(3)
+            result = q.get(payload['id'])['result']
+            self.assertEqual(result['execution_status'], 'timeout')
+            self.assertTrue(q.output(payload['id'])['done'])
+        finally:
+            q.close()
+
     def test_cleanup_failure_overrides_app_zero(self):
         self.ready()
         session = self.backend.sessions[4]
@@ -164,24 +190,362 @@ class ResidentTests(unittest.TestCase):
         self.assertEqual(result['execution_status'], 'platform_error')
         self.assertNotEqual(result['exit_code'], 0)
 
-    def test_whitelist_busy_and_shared_board_wait(self):
+    def test_timeout_and_running_cancel_reuse_pid_session_without_cooldown(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        epoch, pid = session.epoch, session.process.pid
+        q = JobQueue(self.root / 'abort.db', self.backend, self.images, cooldown=60)
+        try:
+            for i, cancel in ((1, False), (2, True)):
+                payload = self.task(i, 'hang')
+                payload['timeout'] = 1
+                q.submit(payload)
+                q.dispatch_once()
+                if cancel:
+                    deadline = time.monotonic() + 2
+                    while time.monotonic() < deadline:
+                        if b'ordinary PASS' in (self.backend.read_output(payload['id'], 0, 65536) or b''):
+                            break
+                        time.sleep(.005)
+                    self.assertEqual(q.cancel(payload['id'])['state'], 'cancelling')
+                    self.assertEqual(q.cancel(payload['id'])['state'], 'cancelling')
+                for worker in list(q.workers):
+                    worker.join(4)
+                task = q.get(payload['id'])
+                self.assertEqual(task['state'], 'cancelled' if cancel else 'failed')
+                result = task['result']
+                self.assertEqual(result['execution_status'], 'cancelled' if cancel else 'timeout')
+                self.assertIsNone(result['app_exit_code'])
+                self.assertIn('ordinary PASS', result['uart_output'])
+                self.assertTrue(result['details']['reset_confirmed'])
+                self.assertIs(self.backend.sessions[4], session)
+                self.assertEqual(self.backend.states[4]['state'], 'READY')
+                self.assertEqual(q.db.execute('SELECT count(*) FROM cooldowns').fetchone()[0], 0)
+                self.assertEqual(q.cancel(payload['id'])['state'], task['state'])
+                # Crash after atomic result publication but before DB terminal
+                # publication must recover the same abort, never execute again.
+                with q.lock:
+                    row = dict(q.db.execute('SELECT * FROM jobs WHERE id=?', (payload['id'],)).fetchone())
+                recovered = self.backend.recover(row)
+                self.assertEqual(recovered['execution_status'], result['execution_status'])
+                self.assertEqual(recovered['details']['session'], epoch)
+                hello = self.run_task(self.task(i + 10))
+                self.assertEqual(hello['execution_status'], 'exited')
+                self.assertEqual((hello['details']['session'], hello['details']['uvhs_pid']), (epoch, pid))
+                self.assertNotIn('ordinary PASS', hello['uart_output'])
+            self.assertEqual((session.directory / 'downloads').read_text().count('download'), 1)
+        finally:
+            q.close()
+
+    def test_cancel_during_memory_load_never_releases_cpu_or_resets_concurrently(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        entered, proceed = threading.Event(), threading.Event()
+        original = session.command
+        def command(script, *args, **kwargs):
+            if script.startswith('writemem'):
+                entered.set()
+                proceed.wait(2)
+            return original(script, *args, **kwargs)
+        q = JobQueue(self.root / 'load-cancel.db', self.backend, self.images)
+        payload = self.task(1)
+        try:
+            with patch.object(session, 'command', side_effect=command):
+                q.submit(payload)
+                q.dispatch_once()
+                self.assertTrue(entered.wait(2))
+                seq = session.seq
+                self.assertEqual(q.cancel(payload['id'])['state'], 'cancelling')
+                time.sleep(.03)
+                self.assertEqual(session.seq, seq)  # Handler did not send reset.
+                self.assertIn(('local', 4), q.reserved)
+                proceed.set()
+                for worker in list(q.workers):
+                    worker.join(4)
+            result = q.get(payload['id'])['result']
+            self.assertEqual(result['execution_status'], 'cancelled')
+            self.assertTrue(result['details']['reset_confirmed'])
+            self.assertFalse((session.directory / 'release').exists())
+            self.assertFalse((self.backend.root / 'jobs' / payload['id'] / 'start-intent.json').exists())
+            self.assertEqual(self.backend.states[4]['state'], 'READY')
+        finally:
+            proceed.set()
+            q.close()
+
+    def test_cancel_at_cpu_release_safe_point_never_starts_image(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        from fpga_scheduler.models import Cancellation
+        control = Cancellation()
+        original = session.command
+        def command(script, *args, **kwargs):
+            if script == 'reset -name cpu_reset -value 0':
+                control.request('cancel at release')
+            return original(script, *args, **kwargs)
+        payload = self.task(1)
+        self.backend.prepare(payload, 'local', self.images.freeze(payload['id'], payload['sha256']))
+        with patch.object(session, 'command', side_effect=command):
+            result = self.backend.run(payload, 'local', 4, cancellation=control)
+        self.assertEqual(result['execution_status'], 'cancelled')
+        self.assertFalse((session.directory / 'release').exists())
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+
+    def test_cancel_one_port_leaves_other_running_session_untouched(self):
+        self.ready()
+        sessions = {p: (s.epoch, s.process.pid) for p, s in self.backend.sessions.items()}
+        q = JobQueue(self.root / 'parallel-abort.db', self.backend, self.images)
+        tasks = [self.task(i, 'hang') for i in (1, 2)]
+        for task in tasks:
+            task['timeout'] = 5
+            q.submit(task)
+        try:
+            q.dispatch_once()
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if all(b'ordinary PASS' in (self.backend.read_output(t['id'], 0, 65536) or b'') for t in tasks):
+                    break
+                time.sleep(.005)
+            self.assertTrue(all(self.backend.read_output(t['id'], 0, 65536) for t in tasks))
+            q.cancel(tasks[0]['id'])
+            deadline = time.monotonic() + 2
+            while q.get(tasks[0]['id'])['state'] == 'cancelling' and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertEqual(q.get(tasks[0]['id'])['state'], 'cancelled')
+            self.assertEqual(q.get(tasks[1]['id'])['state'], 'running')
+            self.assertEqual(self.backend.states[4]['state'], 'READY')
+            self.assertEqual(self.backend.states[5]['state'], 'BUSY')
+            self.assertEqual({p: (s.epoch, s.process.pid) for p, s in self.backend.sessions.items()}, sessions)
+            self.assertTrue(all(s.downloads == 1 for s in self.backend.sessions.values()))
+        finally:
+            q.cancel(tasks[1]['id'])
+            q.close()
+
+    def test_real_slow_load_cancel_and_missing_ack_quarantine(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 500')
+        q = JobQueue(self.root / 'slow-load.db', self.backend, self.images)
+        try:
+            payload = self.task(1)
+            q.submit(payload)
+            q.dispatch_once()
+            deadline = time.monotonic() + 2
+            while not (session.directory / 'loading').exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            self.assertTrue((session.directory / 'loading').exists())
+            self.assertTrue(session.command_pending)
+            seq = session.seq
+            q.cancel(payload['id'])
+            time.sleep(.03)
+            self.assertEqual(session.seq, seq)
+            self.assertEqual(q.get(payload['id'])['state'], 'cancelling')
+            for worker in list(q.workers):
+                worker.join(4)
+            self.assertEqual(q.get(payload['id'])['result']['execution_status'], 'cancelled')
+            self.assertEqual(self.backend.states[4]['state'], 'READY')
+            self.assertFalse((session.directory / 'release').exists())
+
+            # A command that never acknowledges within its bound cannot be
+            # followed by reset while Tcl may still be executing writemem.
+            session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+            session.command_timeout = .1
+            result = self.run_task(self.task(2))
+            self.assertEqual(result['execution_status'], 'platform_error')
+            self.assertEqual(result['details']['interrupted_status'], 'timeout')
+            self.assertFalse(result['details']['reset_confirmed'])
+            self.assertIn('unacknowledged', result['details']['cleanup_error'])
+            self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+            self.assertFalse((session.directory / 'release').exists())
+            self.assertIs(self.backend.sessions[4], session)
+            self.assertEqual(session.downloads, 1)
+        finally:
+            q.close()
+
+    def test_failed_timeout_reset_quarantines_without_automatic_rebuild(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        original = session.reset
+        calls = []
+        def reset():
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError('reset query failed')
+            return original()
+        payload = self.task(1, 'hang')
+        payload['timeout'] = 1
+        with patch.object(session, 'reset', side_effect=reset):
+            result = self.run_task(payload)
+        self.assertEqual(result['execution_status'], 'platform_error')
+        self.assertEqual(result['details']['interrupted_status'], 'timeout')
+        self.assertFalse(result['details']['reset_confirmed'])
+        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+        time.sleep(.03)
+        with patch.object(self.backend, '_initialize') as initialize:
+            ports = self.backend.probe('local')
+            initialize.assert_not_called()
+        self.assertFalse(ports[0]['available'])
+        self.assertIs(self.backend.sessions[4], session)
+        self.assertEqual(session.downloads, 1)
+        self.assertEqual(self.run_task(self.task(2))['exit_code'], BUSY_EXIT)
+
+    def test_cancel_uart_cleanup_failure_quarantines_and_preserves_reason(self):
+        self.ready()
+        from fpga_scheduler.models import Cancellation
+        session = self.backend.sessions[4]
+        control = Cancellation()
+        original, calls = session.boundary, []
+        def boundary():
+            calls.append(1)
+            if len(calls) == 2:
+                control.request('cancel before execution')
+            if len(calls) == 3:
+                raise RuntimeError('UART cannot become quiet')
+            return original()
+        payload = self.task(1)
+        self.backend.prepare(payload, 'local', self.images.freeze(payload['id'], payload['sha256']))
+        with patch.object(session, 'boundary', side_effect=boundary):
+            result = self.backend.run(payload, 'local', 4, cancellation=control)
+        self.assertEqual(result['execution_status'], 'platform_error')
+        self.assertEqual(result['details']['interrupted_status'], 'cancelled')
+        self.assertIn('UART', self.backend.states[4]['reason'])
+        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+
+    def test_cancel_during_unresponsive_command_is_platform_failure_and_quarantined(self):
+        self.ready()
+        from fpga_scheduler.models import Cancellation
+        from fpga_scheduler.remote.uvhs_session import CommandTimeout
+        session = self.backend.sessions[4]
+        control = Cancellation()
+        original = session.command
+        def command(script, *args, **kwargs):
+            if script.startswith('writemem'):
+                control.request('client disconnected')
+                raise CommandTimeout('unresponsive write command')
+            return original(script, *args, **kwargs)
+        payload = self.task(1)
+        self.backend.prepare(payload, 'local', self.images.freeze(payload['id'], payload['sha256']))
+        with patch.object(session, 'command', side_effect=command):
+            result = self.backend.run(payload, 'local', 4, cancellation=control)
+        self.assertEqual(result['execution_status'], 'platform_error')
+        self.assertEqual(result['details']['interrupted_status'], 'cancelled')
+        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+
+    def test_shared_board_same_clock_initializes_only_whitelisted_free_ports(self):
         physical = {p: dict(owner='foreign' if p == 6 else '', booked=False, power='on') for p in range(8)}
         with patch.object(self.backend, '_physical', return_value=physical):
             ports = self.backend.probe('local')
         self.assertEqual([p['number'] for p in ports], [4, 5])
-        self.assertTrue(all(not p['available'] for p in ports))
-        self.assertFalse(self.backend.sessions)
-        self.ready()
-        with self.backend.guard:
-            self.backend.states[5].update(state='BUSY')
-            self.backend.states[4].update(state='RECOVERING')
-        with patch.object(self.backend, '_physical') as query:
-            self.backend.probe('local')
-            query.assert_not_called()
-        self.backend.states[5]['state'] = 'READY'
-        self.backend.states[4]['state'] = 'READY'
+        self.assertTrue(all(p['available'] for p in ports), ports)
+        self.assertEqual(set(self.backend.sessions), {4, 5})
+        for session in self.backend.sessions.values():
+            self.assertFalse((session.directory / 'clock-configs').exists())
+            self.assertEqual((session.directory / 'downloads').read_text().count('download'), 1)
         with self.assertRaisesRegex(ValueError, 'whitelist'):
             self.backend.run(self.task(1), 'local', 6)
+
+    def test_initialization_does_not_wait_for_busy_managed_sibling(self):
+        with self.backend.guard:
+            self.backend._initialize(5)
+            sibling = self.backend.sessions[5]
+            self.backend.states[5]['state'] = 'BUSY'
+            ports = self.backend.probe('local')
+        self.assertTrue(ports[0]['available'], ports)
+        self.assertEqual(ports[1]['state'], 'BUSY')
+        self.assertIs(self.backend.sessions[5], sibling)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+        self.backend.states[5]['state'] = 'READY'
+
+    def test_occupied_target_is_never_initialized_even_with_matching_clocks(self):
+        for ownership in (dict(owner='foreign', booked=False), dict(owner='', booked=True)):
+            physical = {p: dict(owner='', booked=False, power='on') for p in range(8)}
+            physical[4].update(ownership)
+            with self.subTest(**ownership), patch.object(self.backend, '_physical', return_value=physical), \
+                    patch.object(self.backend, '_clocks') as clocks:
+                self.backend._initialize(4)
+                clocks.assert_not_called()
+                self.assertNotIn(4, self.backend.sessions)
+                self.assertIn('occupied', self.backend.states[4]['reason'])
+
+    def test_shared_board_clock_mismatch_or_unknown_blocks_without_download(self):
+        physical = {p: dict(owner='foreign' if p == 7 else '', booked=False, power='on') for p in range(8)}
+        for clocks in ({(1, 6): 14745600}, {(0, 6): 5529600}, {}):
+            with self.subTest(clocks=clocks), patch.object(self.backend, '_physical', return_value=physical), \
+                    patch.object(self.backend, '_clocks', return_value=clocks):
+                self.backend._initialize(4)
+                self.assertFalse(self.backend.sessions)
+                self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+                self.assertEqual(self.backend.states[4]['attempts'], 0)
+                self.assertIn('expected 5529600 Hz', self.backend.states[4]['reason'])
+                self.assertIn('FPGA7 active', self.backend.states[4]['reason'])
+                self.assertFalse((self.backend.root / 'ports/4/downloads').exists())
+
+    def test_empty_board_can_configure_clock_and_environment_cannot_override_profile(self):
+        path = self.project / 'user_script/hw_run/hw_run4.tcl'
+        path.write_text(path.read_text().replace(
+            'config -clock -frequency 5529600 sys_clk',
+            'set sys_clk_hz 5529600\n'
+            'if {[info exists ::env(UV_RUN_SYS_CLK_HZ)]} {set sys_clk_hz $::env(UV_RUN_SYS_CLK_HZ)}\n'
+            'config -clock -frequency $sys_clk_hz sys_clk'))
+        self.backend.bootstraps[4] = self.backend._bootstrap(4)
+        with patch.object(self.backend, '_clocks', return_value={(1, 6): 16260162}), \
+                patch.dict(os.environ, UV_RUN_SYS_CLK_HZ='14745600'):
+            self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+        commands = (self.backend.sessions[4].directory / 'clock-configs').read_text()
+        self.assertIn('-frequency 5529600 sys_clk', commands)
+        self.assertIn('-commit', commands)
+        self.assertNotIn('14745600', commands)
+
+    def test_live_clock_parser_uses_physical_board_and_rejects_duplicates(self):
+        output = ('Board Index Frequency(MHz) Clock Signal Name Type\n'
+                  'B0 6 16.260162 NA PLL\nB1 6 5.529600 NA PLL\n'
+                  'B1 7 14.745600 NA PLL\n')
+        with patch.object(self.backend, '_hardware_query', return_value=output):
+            clocks = self.backend._clocks()
+            self.assertEqual(set(clocks), {(0, 6), (1, 6), (1, 7)})
+            for key, expected in {(0, 6): 16260162, (1, 6): 5529600, (1, 7): 14745600}.items():
+                self.assertAlmostEqual(clocks[key], expected)
+        with patch.object(self.backend, '_hardware_query', return_value=output + 'B1 6 5.529600 NA PLL\n'):
+            with self.assertRaisesRegex(RuntimeError, 'duplicate'):
+                self.backend._clocks()
+
+    def test_reinitialize_refreshes_database_from_current_hardware_project(self):
+        source = self.project / 'hw.dat'
+        source.rmdir()
+        previous, current = self.root / 'patch13', self.root / 'patch14'
+        previous.mkdir()
+        current.mkdir()
+        source.symlink_to(previous)
+        self.ready()
+        old = self.backend.sessions[4]
+        source.unlink()
+        source.symlink_to(current)
+        # Existing sessions keep their version until explicitly rebuilt.
+        self.assertEqual((old.directory / 'hw.dat').resolve(), previous)
+        self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+        self.assertIsNot(self.backend.sessions[4], old)
+        self.assertIsNotNone(old.process.poll())
+        self.assertEqual((self.backend.sessions[4].directory / 'hw.dat').resolve(), current)
+        self.assertEqual((self.backend.sessions[5].directory / 'hw.dat').resolve(), previous)
+
+    def test_initialization_repairs_broken_link_but_preserves_local_database_directory(self):
+        directory = self.backend.root / 'ports/4'
+        directory.mkdir(parents=True)
+        database = directory / 'hw.dat'
+        database.symlink_to(self.root / 'removed-old-database')
+        self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+        self.assertEqual(database.resolve(), (self.project / 'hw.dat').resolve())
+        self.backend.sessions.pop(4).close()
+        database.unlink()
+        database.mkdir()
+        sentinel = database / 'keep'
+        sentinel.write_text('local data')
+        self.backend._initialize(4)
+        self.assertNotIn(4, self.backend.sessions)
+        self.assertIn('refusing to replace', self.backend.states[4]['reason'])
+        self.assertEqual(sentinel.read_text(), 'local data')
 
     def test_fifo_two_ports_cancel_idempotence_recovery_and_retention(self):
         self.ready()
@@ -288,9 +652,13 @@ class RecoveryAndQuotaTests(unittest.TestCase):
                     '[[nodes]]\nid="local"\nports=[4,5]\nuvhs_shell="/vendor/uvhs"\n')
             path.write_text(base)
             self.assertEqual(load(path).nodes[0].ports, (4,5))
+            path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=0'))
+            self.assertEqual(load(path).resident['shared_clock_index'], 0)
             for bad in (base + 'ssh_host="remote"\n', base.replace('ports=[4,5]', 'ports=[4,4]'),
                         base.replace('hardware_project="project"', 'profile="dma"\nhardware_project="project"'),
-                        base.replace('lock_dir="locks"', 'lock_dir="locks"\nrecovery_attempts=1.5')):
+                        base.replace('lock_dir="locks"', 'lock_dir="locks"\nrecovery_attempts=1.5'),
+                        *(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=' + value)
+                          for value in ('-1', '24', 'true', '6.0'))):
                 path.write_text(bad)
                 with self.assertRaises(ValueError):
                     load(path)

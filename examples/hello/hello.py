@@ -82,5 +82,5 @@ if __name__ == '__main__':
         print(f'执行失败: {error}', file=sys.stderr)
         raise SystemExit(1)
     except KeyboardInterrupt:
-        print('\n停止等待；已提交任务仍可用上方任务 ID 查询。', file=sys.stderr)
+        print('\n客户端退出，取消未结束任务；可用上方任务 ID 查询收尾结果。', file=sys.stderr)
         raise SystemExit(130)

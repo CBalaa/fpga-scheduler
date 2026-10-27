@@ -47,9 +47,21 @@ def status(path):
     if value['supervisor_alive']:
         try:
             client = _client(config)
-            value.update(api=client.health(), queue=client.jobs(limit=1), ports=client.devices())
+            value['api'] = client.health()
         except SchedulerError as error:
             value['api_error'] = str(error)
+            return value
+        # Persist each successful component before querying the next one.
+        # /devices may initialize/recover hardware and exceed our short HTTP
+        # timeout; that does not mean the already-healthy API is unavailable.
+        for name, query in (('queue', lambda: client.jobs(limit=1)), ('ports', client.devices)):
+            try:
+                value[name] = query()
+            except SchedulerError as error:
+                value[name + '_error'] = str(error)
+                if name == 'ports':
+                    value['ports_note'] = ('Port status unavailable; initialization or recovery may still be '
+                                           'in progress. API health is reported separately; retry status later.')
     return value
 
 

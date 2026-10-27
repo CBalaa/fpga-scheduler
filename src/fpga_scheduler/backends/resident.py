@@ -19,9 +19,14 @@ from ..remote.runtime import parse_fpgas
 from ..remote.uvhs_session import Session, atomic_json, fingerprint, retire_record
 
 
+NH_CLOCK_HZ = 5529600
+
+
 class Resident:
+    supports_cancellation = True
     def __init__(self, nodes, state_dir, *, hardware_project, lock_dir,
-                 recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824, **options):
+                 recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824,
+                 shared_clock_index=6, **options):
         if len(nodes) != 1:
             raise ValueError('Resident backend manages exactly one local node')
         self.nodes, self.node = nodes, nodes[0]
@@ -30,6 +35,9 @@ class Resident:
         self.project, self.locks = Path(hardware_project), Path(lock_dir)
         self.locks.mkdir(parents=True, exist_ok=True)
         self.options = options
+        if type(shared_clock_index) is not int or not 0 <= shared_clock_index <= 23:
+            raise ValueError('shared_clock_index must be an integer in 0..23')
+        self.shared_clock_index = shared_clock_index
         self.recovery_attempts, self.backoff = recovery_attempts, recovery_backoff
         self.max_storage = max_storage_bytes
         self.guard = threading.RLock()
@@ -65,6 +73,16 @@ class Resident:
                 'reset -name cpu_reset -value 1' not in prefix or
                 'reset -name cpu_reset -value 0' in prefix or '5529600' not in prefix):
             raise ValueError('Unsupported resident NH hardware bootstrap')
+        clock_lines = [line.strip() for line in prefix.splitlines()
+                       if re.match(r'^\s*config\s+-clock\b', line)]
+        frequency = r'config -clock -frequency (?:5529600|\$sys_clk_hz) sys_clk'
+        if (len(clock_lines) != 2 or not re.fullmatch(frequency, clock_lines[0])
+                or clock_lines[1] != 'config -clock -commit'):
+            raise ValueError('Unsupported resident NH clock configuration')
+        # The NH-only profile fixes UART timing. Do not inherit a login shell's
+        # UV_RUN_SYS_CLK_HZ override when initializing alongside other users.
+        prefix = re.sub(r'(?m)^\s*' + frequency + r'\s*$',
+                        f'config -clock -frequency {NH_CLOCK_HZ} sys_clk', prefix)
         # Administrator-controlled project, copied into an isolated workdir.
         return prefix + '\nreset -name cpu_reset -value 1\nquery -reset\n'
 
@@ -77,7 +95,7 @@ class Resident:
             handle.close()
             return None
 
-    def _physical(self):
+    def _hardware_query(self, commands):
         with tempfile.TemporaryDirectory(prefix='inventory-', dir=self.root) as work:
             process = subprocess.Popen([self.node.uvhs_shell, '-t', 'runtime', '-d', 'V1', '-workdir', work],
                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -85,15 +103,51 @@ class Resident:
             record = self.root / 'probes' / (uuid.uuid4().hex + '.json')
             try:
                 atomic_json(record, dict(pid=process.pid, start_ticks=fingerprint(process.pid)))
-                output, _ = process.communicate('query -fpgas -all\nexit\n', timeout=45)
+                output, _ = process.communicate(commands + '\nexit\n', timeout=45)
             finally:
                 if record.exists():
                     retire_record(record)
                     record.unlink()
                 process.wait()
             if process.returncode or platform_error(output.encode()):
-                raise RuntimeError('UVHS inventory query failed')
-        return parse_fpgas(output)
+                raise RuntimeError('UVHS hardware query failed')
+        return output
+
+    def _physical(self):
+        return parse_fpgas(self._hardware_query('query -fpgas -all'))
+
+    def _clocks(self):
+        # With no DB loaded this reports live board clocks, not the database's
+        # sign-off defaults. -board can still return every board; filter by ID.
+        output = self._hardware_query('set_option runtime.database.remapping_enable true\nquery -clock')
+        clocks = {}
+        for line in output.splitlines():
+            match = re.fullmatch(r'\s*B([01])\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\S+\s+PLL\s*', line)
+            if match:
+                key = int(match[1]), int(match[2])
+                if key in clocks:
+                    raise RuntimeError('UVHS returned a duplicate board clock')
+                clocks[key] = float(match[3]) * 1000000
+        return clocks
+
+    def _initialization_script(self, number, physical):
+        board = number // 4
+        active = sorted(p for p, info in physical.items() if p != number and p // 4 == board
+                        and (info['owner'] or info['booked'] or p in self.sessions))
+        frequency = self._clocks().get((board, self.shared_clock_index))
+        if frequency is not None and abs(frequency - NH_CLOCK_HZ) <= .5:
+            # Even committing the same frequency can touch sibling outputs of
+            # the PLL. Reuse the existing clock without any config -clock call.
+            script = re.sub(r'(?m)^\s*config -clock[^\n]*$', '', self.bootstraps[number])
+            return f'puts {{Scheduler: reuse B{board}.GCLK{self.shared_clock_index} at {NH_CLOCK_HZ} Hz}}\n' + script
+        if active:
+            actual = 'unknown' if frequency is None else f'{frequency:g} Hz'
+            self.states[number].update(
+                reason=f'Shared B{board}.GCLK{self.shared_clock_index} is {actual}; expected {NH_CLOCK_HZ} Hz; '
+                       + 'cannot change clock while ' + ', '.join(f'FPGA{p}' for p in active) + ' active',
+                next_retry=time.monotonic() + self.backoff)
+            return None
+        return self.bootstraps[number]
 
     def _uart_busy(self, number):
         device = Path(self.node.uart_prefix + str(number))
@@ -121,9 +175,6 @@ class Resident:
     def _initialize(self, number):
         state = self.states[number]
         board = number // 4
-        if any(p // 4 == board and s['state'] == 'BUSY' for p, s in self.states.items()):
-            state['reason'] = 'Waiting for active tasks before board initialization'
-            return
         board_lock = self._lock(f'board{board}.lock')
         if board_lock is None:
             state['reason'] = 'Board maintenance active'
@@ -131,10 +182,13 @@ class Resident:
         handle = None
         try:
             physical = self._physical()
-            for p, info in physical.items():
-                if p // 4 == board and (info['owner'] or info['booked']) and p not in self.sessions:
-                    state['reason'] = f'Board occupied by unmanaged FPGA{p}; no shared operations allowed'
-                    return
+            # A sibling FPGA is an independent execution slot. Only ownership
+            # of this target prevents allocation; shared clocks are checked
+            # separately before any initialization commands are submitted.
+            info = physical[number]
+            if (info['owner'] or info['booked']) and number not in self.sessions:
+                state['reason'] = f'FPGA{number} occupied by another session'
+                return
             if number in self.sessions:
                 self.sessions.pop(number).close()
                 # Confirm unload retired ownership before any full rebuild.
@@ -150,6 +204,9 @@ class Resident:
             if reason:
                 state['reason'] = reason
                 return
+            bootstrap = self._initialization_script(number, physical)
+            if bootstrap is None:
+                return
             handle = self._lock(f'fpga{number}.lock')
             if handle is None:
                 state['reason'] = 'Port lock held by another executor'
@@ -157,12 +214,24 @@ class Resident:
             directory = self.root / 'ports' / str(number)
             directory.mkdir(parents=True, exist_ok=True)
             database = directory / 'hw.dat'
-            if not database.exists():
-                database.symlink_to((self.project / 'hw.dat').resolve())
+            target = (self.project / 'hw.dat').resolve(strict=True)
+            if not target.is_dir():
+                raise RuntimeError('Hardware project hw.dat must be a database directory')
+            if database.exists() and not database.is_symlink():
+                raise RuntimeError('Resident hw.dat is not a symlink; refusing to replace local data')
+            if not database.is_symlink() or database.resolve() != target:
+                # Pin the current project version for this session. Refresh old
+                # deployment links only after its previous session has retired.
+                temporary = directory / ('hw.dat-' + uuid.uuid4().hex + '.tmp')
+                try:
+                    temporary.symlink_to(target)
+                    temporary.replace(database)
+                finally:
+                    temporary.unlink(missing_ok=True)
             session = Session(self.node, number, directory, handle, **self.options)
             handle = None  # Ownership transferred, including failures.
             try:
-                session.start(self.bootstraps[number])
+                session.start(bootstrap)
             except BaseException:
                 session.close()
                 raise
@@ -201,7 +270,9 @@ class Resident:
         if used + reserve > self.max_storage // 2 or shutil.disk_usage(self.root).free < reserve + 16777216:
             raise OSError('Resident storage quota exceeded; retained active inputs are protected')
 
-    def prepare(self, payload, node, image):
+    def prepare(self, payload, node, image, *, cancellation=None):
+        if cancellation:
+            cancellation.check()
         if node != self.node.id:
             raise ValueError('Unknown node')
         reserve = (max(1048576, (image.stat().st_size + 1048575) // 1048576 * 1048576) * 2 +
@@ -213,7 +284,12 @@ class Resident:
             self.storage_reserved[payload['id']] = reserve
             self.inputs[payload['id']] = image
 
-    def run(self, payload, node, port):
+    def release_prepared(self, ident):
+        with self.guard:
+            self.storage_reserved.pop(ident, None)
+            self.inputs.pop(ident, None)
+
+    def run(self, payload, node, port, *, cancellation=None):
         with self.guard:
             if node != self.node.id or port not in self.states:
                 raise ValueError('Port outside whitelist')
@@ -224,7 +300,8 @@ class Resident:
             session = self.sessions[port]
             self.states[port].update(state='BUSY', reason='Task executing')
         try:
-            result, healthy = session.execute(payload, image, self.root / 'jobs' / payload['id'])
+            result, healthy = session.execute(payload, image, self.root / 'jobs' / payload['id'],
+                                              cancellation=cancellation)
         except BaseException:
             with self.guard:
                 self.storage_reserved.pop(payload['id'], None)
@@ -235,11 +312,30 @@ class Resident:
             if healthy:
                 self.states[port].update(state='READY', reason='')
             else:
-                # Full rebuild waits until the other local tasks on this board
-                # finish. A reset alone does not establish peripheral safety.
+                aborted = (result['execution_status'] in ('timeout', 'cancelled') or
+                           result['details'].get('interrupted_status') in ('timeout', 'cancelled'))
+                if aborted:
+                    reason = result['details'].get('cleanup_error') or result['details'].get('error') or 'Unconfirmed cleanup'
+                    self.states[port].update(state='QUARANTINED', reason='Abort cleanup failed: ' + reason)
+                    return result
+                # Rebuild only this slot; initialization checks shared clocks.
+                # A reset alone does not establish peripheral safety.
                 self.states[port].update(state='RECOVERING', reason='Task fault; full reinitialization required',
                                          next_retry=time.monotonic() + self.backoff)
         return result
+
+    def read_output(self, ident, offset, limit):
+        # Session.execute flushes this per-job file after every UART read.
+        # No session lock: reading output must not wait for execution to finish.
+        path = self.root / 'jobs' / ident / 'uart.raw.log'
+        try:
+            with path.open('rb') as handle:
+                if offset > os.fstat(handle.fileno()).st_size:
+                    raise ValueError('Output offset exceeds available bytes')
+                handle.seek(offset)
+                return handle.read(limit)
+        except FileNotFoundError:
+            return None
 
     def recover(self, job):
         path = self.root / 'jobs' / job['id'] / 'result.json'

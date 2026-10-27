@@ -39,6 +39,8 @@ class Config:
     cooldown_seconds: float = 60
     retention_days: float = 7
     transfer_timeout: float = 120
+    client_heartbeat_seconds: float = 2
+    client_lease_seconds: float = 15
     simulator: dict = field(default_factory=dict)
     resident: dict = field(default_factory=dict)
 
@@ -98,9 +100,15 @@ def load(path):
     if len({n.id for n in nodes}) != len(nodes):
         raise ValueError('Node IDs must be unique')
     data['nodes'] = tuple(nodes)
-    for name in ('poll_interval', 'retention_days', 'transfer_timeout'):
+    for name in ('poll_interval', 'retention_days', 'transfer_timeout',
+                 'client_heartbeat_seconds', 'client_lease_seconds'):
         if name in data:
             positive(data[name], name)
+    if data.get('client_heartbeat_seconds', 2) >= data.get('client_lease_seconds', 15):
+        raise ValueError('client_heartbeat_seconds must be less than client_lease_seconds')
+    for name, default in (('client_heartbeat_seconds', 2), ('client_lease_seconds', 15)):
+        if not .01 <= data.get(name, default) <= 3600:
+            raise ValueError(f'{name} must be within 0.01..3600')
     if 'cooldown_seconds' in data:
         positive(data['cooldown_seconds'], 'cooldown_seconds', inclusive=True)
     for name, maximum in (('port', 65535), ('queue_capacity', 100000)):
@@ -129,7 +137,7 @@ def load(path):
     resident = dict(data.get('resident', {}))
     fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout',
               'uart_quiet_seconds', 'recovery_attempts', 'recovery_backoff',
-              'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile'}
+              'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile', 'shared_clock_index'}
     if set(resident) - fields:
         raise ValueError('Unknown resident options')
     if backend == 'bosc-resident':
@@ -142,7 +150,10 @@ def load(path):
             if not isinstance(resident[name], str) or not resident[name] or any(c in resident[name] for c in ('\x00', '\n', '\r')):
                 raise ValueError(f'Invalid resident {name}')
             resident[name] = str((path.parent / resident[name]).resolve())
-    for name in fields - {'hardware_project', 'lock_dir', 'profile'}:
+    if ('shared_clock_index' in resident and
+            (type(resident['shared_clock_index']) is not int or not 0 <= resident['shared_clock_index'] <= 23)):
+        raise ValueError('shared_clock_index must be an integer in 0..23')
+    for name in fields - {'hardware_project', 'lock_dir', 'profile', 'shared_clock_index'}:
         if name in resident:
             positive(resident[name], name)
     for name in ('recovery_attempts', 'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes'):

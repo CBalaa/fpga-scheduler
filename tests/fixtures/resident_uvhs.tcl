@@ -3,7 +3,13 @@ set work [lindex $argv [expr {[lsearch $argv -workdir] + 1}]]
 set loaded ""
 set reset_value 1
 proc load_db {args} {}
-proc config {args} {}
+proc set_option {args} {}
+proc config {args} {
+    global work
+    if {[lindex $args 0] eq "-clock"} {
+        set f [open [file join $work clock-configs] a]; puts $f $args; close $f
+    }
+}
 proc initialize {} {}
 proc download {} {
     global work
@@ -13,6 +19,7 @@ proc query {args} {
     global reset_value
     switch -- [lindex $args 0] {
         -fpgas {for {set p 0} {$p < 8} {incr p} {puts "uvhs-0 B[expr {$p / 4}] F[expr {$p % 4}] on link down false"}}
+        -clock {puts "B0 6 5.529600 NA PLL"; puts "B1 6 5.529600 NA PLL"}
         -reset {
             if {[info exists ::env(FAKE_RESET_QUERY_ZERO)]} {puts "Command: reset -name cpu_reset -value 1"; puts "0 1 cpu_reset 0"} else {puts "cpu_reset $reset_value"}
         }
@@ -28,8 +35,12 @@ proc reset {args} {
     if {$reset_value == 1 && [info exists ::env(FAKE_RESET_ERROR)]} {error "injected reset failure"}
 }
 proc writemem {args} {
-    global loaded
+    global loaded work
     set loaded [lindex $args [expr {[lsearch $args -file] + 1}]]
+    if {[info exists ::env(FAKE_LOAD_DELAY)]} {
+        set f [open [file join $work loading] w]; puts $f loading; close $f
+        after $::env(FAKE_LOAD_DELAY)
+    }
     if {[info exists ::env(FAKE_COMMAND_ERROR)]} {error "injected command error"}
 }
 proc readmem {args} {

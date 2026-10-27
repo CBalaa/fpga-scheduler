@@ -7,6 +7,8 @@ poll_interval = 1
 queue_capacity = 256
 cooldown_seconds = 5
 retention_days = 7
+client_heartbeat_seconds = 2
+client_lease_seconds = 15
 
 [resident]
 profile = "nh-only"
@@ -14,6 +16,10 @@ hardware_project = "/path/to/existing-hardware-project"
 # Shared with every legacy/resident deployment that can operate these ports.
 # Administrator provisions directory access for the service account.
 lock_dir = "/path/to/shared/scheduler-locks"
+# Physical clock output used by sys_clk; verify against the hardware project.
+# Matching 5.5296 MHz is reused without clock reconfiguration, even when
+# sibling FPGAs have active sessions. A mismatch waits while siblings are busy.
+shared_clock_index = 6
 startup_timeout = 300
 command_timeout = 60
 uart_quiet_seconds = 0.2

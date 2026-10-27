@@ -1,5 +1,10 @@
 # BOSC 真机接入与复现
 
+本页为旧 SSH 后端的历史部署/验收说明。该后端保留传输和执行器回归，
+但尚不支持安全运行中取消，当前 SDK 的租约提交会明确返回 409。
+新部署和前台 CLI/Python 执行请按 [README](../README.md) 使用 bosc-resident；
+以下旧版提交与验收命令不能作为新版 SDK 的可执行教程。
+
 以下命令在调度仓库根目录执行。SSH 主机、远端路径、令牌和部署记录保存在本地
 配置或 build/ 中，不提交个人环境值。设备池示例仅使用 4、5、6、7。
 
@@ -67,8 +72,7 @@ fpga-scheduler serve --config config.local.toml
 ```bash
 export FPGA_SCHEDULER_TOKEN_FILE="$PWD/secrets/service.token"
 fpga-scheduler devices
-fpga-scheduler submit build/hello/hello/hello.bin
-fpga-scheduler wait <返回的任务ID> --timeout 600
+fpga-scheduler run build/hello/hello/hello.bin
 ```
 
 用户连接调度器 HTTP 地址；服务器 SSH 凭据只在服务端使用。其他机器可通过 SSH

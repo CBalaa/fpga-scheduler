@@ -42,14 +42,16 @@ class HTTPTests(unittest.TestCase):
         self.opener = build_opener(ProxyHandler({}))
 
     def tearDown(self):
+        self.client.close()
         self.app.server.shutdown()
         self.thread.join()
         self.app.close()
         self.tmp.cleanup()
 
-    def cli(self, *args):
+    def cli(self, *args, json_output=True):
         env = {**os.environ, 'PYTHONPATH': str(PROJECT / 'src'), 'NO_PROXY': '*', 'no_proxy': '*'}
-        return subprocess.run([sys.executable, '-m', 'fpga_scheduler', '--json', '--endpoint', self.endpoint,
+        flags = ['--json'] if json_output else []
+        return subprocess.run([sys.executable, '-m', 'fpga_scheduler', *flags, '--endpoint', self.endpoint,
                                '--token-file', str(self.token), *args], capture_output=True, text=True, env=env)
 
     def request(self, route, method='GET', body=None, token=TOKEN):
@@ -84,11 +86,31 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(health.stdout)['hardware_checked'], False)
         devices = self.cli('devices')
         self.assertEqual(len(json.loads(devices.stdout)['devices']), 2)
+        run = self.cli('run', str(self.image))
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(json.loads(run.stdout)['state'], 'completed')
+
+    def test_cli_readable_output_over_real_http(self):
+        run = self.cli('run', str(self.image), json_output=False)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.count('SIMULATED FPGA execution PASS'), 1)
+        self.assertIn('PASS\nTask: ', run.stdout)
+        self.assertIn('State: completed', run.stdout)
+        self.assertIn('App exit code: 0', run.stdout)
+        ident = self.client.jobs(('completed',))['jobs'][0]['id']
+        for args, expected in ((('jobs', '--state', 'completed'), ('STATE', ident, 'completed')),
+                               (('job', ident), ('State: completed', 'UART:', 'SIMULATED')),
+                               (('devices',), ('AVAILABLE', 'NODE')),
+                               (('health',), ('API: OK', 'Dispatcher: running'))):
+            with self.subTest(command=args):
+                process = self.cli(*args, json_output=False)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                for text in expected:
+                    self.assertIn(text, process.stdout)
 
     def test_cli_cancel_and_failed_wait_exit_status(self):
         self.app.queue.backend.busy.update(('a', 'b'))
-        submitted = self.cli('submit', str(self.image))
-        ident = json.loads(submitted.stdout)['id']
+        ident = self.client.submit(self.image).id
         cancelled = self.cli('cancel', ident)
         self.assertEqual(json.loads(cancelled.stdout)['state'], 'cancelled')
         waited = self.cli('wait', ident)
@@ -96,7 +118,7 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(waited.stdout)['state'], 'cancelled')
 
     def test_nonzero_application_code_and_clean_uart_survive_http_and_cli(self):
-        self.app.queue.backend.run = lambda payload, node, port: dict(
+        self.app.queue.backend.run = lambda payload, node, port, **kw: dict(
             output='verify hellohspRun> : PASS', uart_output='verify hello: PASS\n',
             exit_code=1, execution_status='exited', app_exit_code=7, details={}, node=node, seconds=.01)
         task = self.client.submit(self.image)
@@ -171,9 +193,9 @@ class HTTPTests(unittest.TestCase):
 
     def test_bad_json_payload_size_hash_and_filters(self):
         for route, method, body, status in (
-            ('/jobs', 'POST', b'not JSON', 400),
-            ('/jobs', 'POST', b'[]', 400),
-            ('/jobs', 'POST', json.dumps(dict(id='a' * 32, sha256='b' * 64)).encode(), 400),
+            ('/jobs', 'POST', b'not JSON', 409),
+            ('/jobs', 'POST', b'[]', 409),
+            ('/jobs', 'POST', json.dumps(dict(id='a' * 32, sha256='b' * 64)).encode(), 409),
             ('/jobs/' + 'a' * 32 + '/image', 'PUT', b'', 400),
             ('/jobs?state=unknown', 'GET', None, 400),
             ('/jobs?limit=-1', 'GET', None, 400),

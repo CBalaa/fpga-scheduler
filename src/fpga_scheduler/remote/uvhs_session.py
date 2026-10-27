@@ -15,6 +15,11 @@ import time
 import uuid
 
 from .runner import Completion, ProtocolError, platform_error
+from ..models import Cancellation, CancelledError
+
+
+class CommandTimeout(RuntimeError):
+    """An unacknowledged command cannot establish a reusable control channel."""
 
 
 def atomic_json(path, value):
@@ -126,6 +131,7 @@ class Session:
         self.master = self.serial = None
         self.saved_attrs = None
         self.pending = b''
+        self.command_pending = False
         self.control = BoundedLog(self.directory / 'control.log', max_session_log_bytes, rotate=True)
         self.downloads = 0
         self.record = self.directory / 'session.json'
@@ -178,7 +184,9 @@ class Session:
         self.control.write(data)
         return data
 
-    def command(self, script, timeout=None):
+    def command(self, script, timeout=None, *, cancellation=None):
+        if self.command_pending:
+            raise RuntimeError('Previous UVHS command is unacknowledged; refusing another hardware command')
         self.seq += 1
         marker = f'@@CONTROL_{self.epoch}_{self.seq} '
         command = ('set __scheduler_rc [catch ' + tcl(script) + ' __scheduler_value]; '
@@ -189,7 +197,16 @@ class Session:
             path.write_text(script + '\n')
             command = ('set __scheduler_rc [catch {source ' + tcl(path) + '} __scheduler_value]; '
                        'puts "' + marker + '$__scheduler_rc"; flush stdout\n').encode()
-        os.write(self.master, command)
+        if cancellation is None:
+            self.command_pending = True
+            os.write(self.master, command)
+        else:
+            # Acceptance of cancellation and the CPU-release write are ordered.
+            # Never hold this guard while awaiting UVHS's response.
+            with cancellation.guard:
+                cancellation.check()
+                self.command_pending = True
+                os.write(self.master, command)
         deadline = time.monotonic() + (self.command_timeout if timeout is None else timeout)
         output = b''
         while time.monotonic() < deadline:
@@ -200,10 +217,11 @@ class Session:
                 raise RuntimeError('UVHS command reported an error')
             match = re.search(rb'(?:^|\n)' + re.escape(marker.encode()) + rb'([0-9]+)\r*\n', output)
             if match:
+                self.command_pending = False
                 if int(match[1]):
                     raise RuntimeError('UVHS Tcl command failed')
                 return output[:match.start()]
-        raise TimeoutError('UVHS command acknowledgement deadline exceeded')
+        raise CommandTimeout('UVHS command acknowledgement deadline exceeded')
 
     def reset(self):
         output = self.command('reset -name cpu_reset -value 1\nquery -reset')
@@ -230,7 +248,8 @@ class Session:
                 return discarded
         raise ProtocolError('UART did not become quiet while reset was asserted')
 
-    def execute(self, payload, image, directory):
+    def execute(self, payload, image, directory, *, cancellation=None):
+        cancellation = cancellation or Cancellation()
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
@@ -243,8 +262,10 @@ class Session:
         reset_ok = False
         log = BoundedLog(directory / 'uart.raw.log', self.max_job_log)
         try:
+            cancellation.check()
             self.reset()
             result['details']['discarded_uart_bytes'] = self.boundary()
+            cancellation.check()
             content = image.read_bytes()
             if hashlib.sha256(content).hexdigest() != payload['sha256']:
                 raise RuntimeError('Input checksum mismatch')
@@ -252,20 +273,25 @@ class Session:
             padded, readback = directory / 'image.bin', directory / 'readback.bin'
             padded.write_bytes(content + bytes(size - len(content)))
             memory = f'nanhu_xilinx.i_ddr[{size // 64 - 1}:0]'
+            cancellation.check()
             self.command('writemem -rtl ' + tcl(memory) + ' -file ' + tcl(padded) + ' -file_type bin\n'
                          'readmem -rtl ' + tcl(memory) + ' -file ' + tcl(readback) + ' -file_type bin',
-                         timeout=max(.01, deadline - time.monotonic()))
+                         timeout=max(.01, min(self.command_timeout, deadline - time.monotonic())))
+            cancellation.check()
             if readback.read_bytes() != padded.read_bytes():
                 raise RuntimeError('DDR readback differs from padded input')
             result['details']['ddr_readback_matches'] = True
             self.boundary()
+            cancellation.check()
             if time.monotonic() >= deadline:
                 raise TimeoutError('Execution deadline exceeded before CPU release')
             atomic_json(directory / 'start-intent.json', dict(id=payload['id'], sha256=payload['sha256'],
                         node=self.node.id, fpga=self.number, session=self.epoch, time=time.time()))
-            self.command('reset -name cpu_reset -value 0', timeout=max(.01, deadline - time.monotonic()))
+            self.command('reset -name cpu_reset -value 0', timeout=max(.01, deadline - time.monotonic()),
+                         cancellation=cancellation)
             terminal_at = None
             while time.monotonic() < deadline:
+                cancellation.check()
                 if select.select([self.serial], [], [], .02)[0]:
                     data = os.read(self.serial, 65536)
                     if not data:
@@ -284,12 +310,21 @@ class Session:
                     break
             else:
                 raise TimeoutError('Execution deadline exceeded')
+            cancellation.check()
+            if cancellation.finish():
+                cancellation.check()
             record = protocol.result
             result.update(execution_status=record['status'], app_exit_code=record.get('app_exit_code'),
                           exit_code=0 if record['status'] == 'exited' and record['app_exit_code'] == 0 else 1)
             result['details']['application'] = record
+        except CancelledError as error:
+            result.update(execution_status='cancelled', exit_code=130)
+            result['details']['cancel_reason'] = str(error)
         except TimeoutError as error:
-            result.update(execution_status='timeout', exit_code=124)
+            reason = cancellation.finish()
+            result.update(execution_status='cancelled' if reason else 'timeout', exit_code=130 if reason else 124)
+            if reason:
+                result['details']['cancel_reason'] = reason
             result['details']['error'] = str(error)
         except ProtocolError as error:
             result.update(execution_status='protocol_error', exit_code=1)
@@ -297,7 +332,14 @@ class Session:
         except (OSError, RuntimeError, ValueError) as error:
             result.update(execution_status='platform_error', exit_code=1)
             result['details']['error'] = str(error)
+            if isinstance(error, CommandTimeout):
+                result['details']['interrupted_status'] = 'timeout'
         finally:
+            reason = cancellation.finish()
+            if reason:
+                result['details']['cancel_reason'] = reason
+                if result['execution_status'] not in ('cancelled', 'exited'):
+                    result['details']['interrupted_status'] = 'cancelled'
             try:
                 self.reset()
                 # Parse bytes arriving during reset too: late duplicate terminal
@@ -312,6 +354,7 @@ class Session:
                 self.boundary()
                 reset_ok = True
             except (OSError, RuntimeError, ValueError) as error:
+                result['details'].setdefault('interrupted_status', result['execution_status'])
                 result.update(execution_status='platform_error', exit_code=1)
                 result['details']['cleanup_error'] = str(error)
             log.close()
@@ -319,7 +362,9 @@ class Session:
             result['uart_output'] = result['output'] = uart.decode(errors='replace')
             result['seconds'] = time.monotonic() - started
             atomic_json(directory / 'result.json', dict(id=payload['id'], sha256=payload['sha256'], result=result))
-        healthy = reset_ok and result['execution_status'] == 'exited'
+        # NH-only: CPU reset + verified quiet UART is the abort reuse boundary.
+        # This does not establish DMA/E6 peripheral quiescence.
+        healthy = reset_ok and result['execution_status'] in ('exited', 'timeout', 'cancelled')
         return result, healthy
 
     def close(self):
@@ -358,7 +403,7 @@ class Session:
                 if self.saved_attrs:
                     termios.tcsetattr(self.serial, termios.TCSANOW, self.saved_attrs)
                 fcntl.ioctl(self.serial, termios.TIOCNXCL)
-            except OSError:
+            except (OSError, termios.error):
                 clean = False
             os.close(self.serial)
         if self.master is not None:

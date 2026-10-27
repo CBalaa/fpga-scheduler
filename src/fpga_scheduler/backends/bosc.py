@@ -11,6 +11,8 @@ from ..models import BUSY_EXIT, BUSY_TOKEN
 
 
 class BOSC:
+    supports_cancellation = False
+
     def __init__(self, nodes, transfer_timeout=120):
         self.nodes = tuple(nodes)
         self.by_id = {n.id: n for n in nodes}

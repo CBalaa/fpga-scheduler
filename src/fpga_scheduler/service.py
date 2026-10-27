@@ -93,7 +93,8 @@ def make_server(address, queue, images, token):
             try:
                 path = urlsplit(self.path)
                 route = path.path
-                match = re.fullmatch(r'/jobs/([0-9a-f]{32})(/image)?', route)
+                match = re.fullmatch(r'/jobs/([0-9a-f]{32})(/image|/output)?', route)
+                session = re.fullmatch(r'/sessions/([0-9a-f]{32})(/heartbeat)?', route)
                 if self.command == 'GET' and route == '/health':
                     alive = queue.dispatcher is not None and queue.dispatcher.is_alive()
                     ok = alive and not queue.stopping.is_set()
@@ -102,21 +103,36 @@ def make_server(address, queue, images, token):
                                                       hardware_checked=False, scheduler_error=queue.status_error))
                 elif self.command == 'GET' and route == '/devices':
                     self.reply(200, queue.inventory())
+                elif self.command == 'PUT' and session and not session[2]:
+                    self.reply(200, queue.open_session(session[1], json.loads(self.body(4096))))
+                elif self.command == 'POST' and session and session[2] == '/heartbeat':
+                    self.reply(200, queue.heartbeat(session[1]))
+                elif self.command == 'DELETE' and session and not session[2]:
+                    self.reply(200, queue.close_session(session[1]))
                 elif self.command == 'GET' and route == '/jobs':
                     query = parse_qs(path.query, keep_blank_values=True)
                     if set(query) - {'state', 'limit', 'offset'} or any(len(v) != 1 for v in query.values()):
                         raise ValueError('Invalid query parameters')
                     states = tuple(query['state'][0].split(',')) if 'state' in query else ACTIVE
                     self.reply(200, queue.list(states, int(query.get('limit', ['100'])[0]), int(query.get('offset', ['0'])[0])))
+                elif self.command == 'GET' and match and match[2] == '/output':
+                    query = parse_qs(path.query, keep_blank_values=True)
+                    if set(query) - {'offset', 'limit'} or any(len(v) != 1 for v in query.values()):
+                        raise ValueError('Invalid output query parameters')
+                    self.reply(200, queue.output(match[1], int(query.get('offset', ['0'])[0]),
+                                                 int(query.get('limit', ['65536'])[0])))
                 elif self.command == 'GET' and match and not match[2]:
                     self.reply(200, queue.get(match[1]))
                 elif self.command == 'DELETE' and match and not match[2]:
                     self.reply(200, queue.cancel(match[1]))
-                elif self.command == 'PUT' and match and match[2]:
+                elif self.command == 'PUT' and match and match[2] == '/image':
                     digest = images.put(match[1], self.body(MAX_IMAGE))
                     self.reply(200, dict(id=match[1], sha256=digest))
                 elif self.command == 'POST' and route == '/jobs':
-                    self.reply(202, queue.submit(json.loads(self.body(131072))))
+                    ident = self.headers.get('X-FPGA-Session')
+                    if ident is None:
+                        raise Conflict('A client session is required; upgrade the SDK / use the foreground run command')
+                    self.reply(202, queue.submit(json.loads(self.body(131072)), session_id=ident))
                 else:
                     self.reply(404, {'error': 'Unknown endpoint'})
             except KeyError:
@@ -170,7 +186,9 @@ class Application:
             self.backend = backend
             self.queue = JobQueue(config.state_dir / 'jobs.sqlite3', backend, images,
                                   interval=config.poll_interval, capacity=config.queue_capacity,
-                                  cooldown=config.cooldown_seconds, retention=config.retention_days * 86400)
+                                  cooldown=config.cooldown_seconds, retention=config.retention_days * 86400,
+                                  client_heartbeat_seconds=config.client_heartbeat_seconds,
+                                  client_lease_seconds=config.client_lease_seconds)
             self.server = make_server((config.bind, config.port), self.queue, images, self.token)
         except BaseException:
             self.close()

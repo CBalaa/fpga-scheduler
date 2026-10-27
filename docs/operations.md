@@ -12,7 +12,9 @@ images/。使用同一状态目录的第二个服务会在访问数据库前退�
 多副本或跨主机 HA。不要通过新建状态目录绕过同一设备池的单实例约束。
 
 SIGTERM/SIGINT 停止接收请求和分配新任务，等待已接受 HTTP 处理及运行任务完成；
-queued 留在数据库待重启。必须保留充足停机时间，BOSC 默认最长执行约 10 分钟，
+queued 留在数据库待重启，关联客户端租约重启时仍须有效，过期则取消。
+daemon 正常停止不会主动取消；提交客户端自身退出或 Client.close() 才请求取消其任务。
+必须保留充足停机时间，BOSC 默认最长执行约 10 分钟，
 另有输入、探测和回收时间。强杀后 running 标为结果未知，不自动重放。
 
 GET /health 只表明服务和调度线程存活；GET /devices 才会探测硬件。
@@ -39,9 +41,14 @@ fpga-scheduler daemon stop
 [常驻运行时](resident-runtime.md)，卸载步骤见本文。
 可选的 systemd 模板仅用于管理员另行托管前台 serve，不与 daemon supervisor 同时使用。
 
+`daemon status` 分别报告 API、队列和端口。硬件初始化或故障恢复可能超过端口查询的
+2 秒等待期限；此时仍显示 API 和队列信息，端口显示 `Ports: unavailable` 及原因，
+不代表 daemon 已退出。先用 `fpga-scheduler health` 检查 API，等待恢复后重查 status；
+不要仅因端口查询超时就重启服务或重复提交 bin。
+
 ## 卸载
 
-使用原部署账号和配置正常停止，确认 supervisor_alive 为 false、硬件清理完成后再移走部署：
+使用原部署账号和配置正常停止，确认 status 显示 `Daemon: STOPPED`、硬件清理完成后再移走部署：
 
 ~~~bash
 . "$HOME/fpga-resident-deploy/env.sh"
@@ -74,7 +81,7 @@ rm -rf -- "$FPGA_RETIRED_DIR"
 如果必须中断运行任务，备份/恢复前先核验远端执行结果和占用，避免重复提交。
 
 恢复：服务关闭状态下恢复完整状态目录和匹配版本代码，修复目录所有权，配置
-相同稳定 node ID 和实际设备映射，然后启动。queued 继续排队；历史 running
+相同稳定 node ID 和实际设备映射，然后启动。queued 在原会话租约有效时继续排队；历史 running/cancelling
 将失败并注明结果未知。恢复队列之前，确认旧服务实例不再存活。
 
 回滚：排空新服务并核验硬件释放，再恢复旧服务及其匹配数据库。不要把本服务
@@ -95,3 +102,9 @@ rm -rf -- "$FPGA_RETIRED_DIR"
 正常 stop 会 drain 并卸载；更换白名单之前用旧配置正常停止。
 使用 systemd 时运行 serve，避免叠加 supervisor。SQLite WAL 与主库须一起备份，
 推荐停服后复制完整 state_dir；不导入旧系统历史任务。
+
+客户端租约默认 2 秒心跳、15 秒失联；配置 client_heartbeat_seconds / client_lease_seconds。
+租约过期会取消关联任务，断网也适用。cancelling 仍占用硬件，等待 worker 复位、清理 UART、
+持久化结果后才结束。NH-only 取消/超时收尾成功保留会话且不冷却；失败端口隔离，
+devices.reasons 给出原因，不自动重建。管理员检查后用原配置正常停止再启动。
+升级需同时更新 daemon 与 SDK：新 HTTP 提交要求客户端会话；旧 SSH 后端明确拒绝新租约提交。
