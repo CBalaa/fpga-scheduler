@@ -2,7 +2,7 @@
 
 在 FPGA 服务器运行 daemon，通过 CLI 或 Python 上传 bin，自动排队、分配端口并返回 UART 和退出码。
 
-前提：构建机、服务器及客户端已有 Python 3.11+（下文以 `python3.11` 为例）。服务器已配置厂商环境、UVHS 和硬件工程，运行账号能访问 UART。当前常驻模式支持 NH-only UART v1 程序，使用 FPGA4、5；不要与旧上板脚本同时管理这些端口。所有 `/path/to/...` 和示例 IP 都需替换。
+前提：构建机、服务器及客户端已有 Python 3.11+（下文以 `python3.11` 为例）。服务器已配置厂商环境、UVHS 和硬件工程，运行账号能访问 UART。当前常驻模式支持 NH-only UART v1 程序，管理显式配置的端口白名单；不要与旧上板脚本同时管理这些端口。所有 `/path/to/...` 和示例 IP 都需替换。
 
 ## 1. 在其他机器构建 wheel，上传并安装
 
@@ -30,9 +30,17 @@ fpga-scheduler init-token "$FPGA_DEPLOY_DIR/service.token"
 
 `init-token` 首次生成随机共享 token，保存在服务器的 `~/fpga-resident-deploy/service.token`（权限 `600`）。daemon 和客户端必须使用相同的 token 内容；后文的 `client.token` 是它的副本，不是重新生成的 token。已有部署直接使用原文件，不要重新生成。
 
-## 2. 配置和管理 daemon
+## 2. 准备初始化 Tcl、配置和管理 daemon
 
-仍在 FPGA 服务器执行。硬件工程须包含 `hw.dat` 和 `user_script/hw_run/hw_run4.tcl`、`hw_run5.tcl`；共享锁目录须与其他硬件入口一致且运行账号可写。
+仍在选定 FPGA 服务器执行。硬件工程须包含 `hw.dat`；共享锁目录须与其他硬件入口一致且运行账号可写。初始化文件属于 scheduler 部署配置，须由部署者在启动 daemon 前准备：
+
+1. 找到**该机器、该 FPGA 已验证可用**的 `~/Desktop/fpga-tester/user_script/hw_run/hw_runN.tcl`，只读检查当前内容及 SHA-256。
+2. 在部署目录创建 `init/initN.tcl`。对当前参考脚本，人工复制 `source ./user_script/hw_run/write_image.tcl` **之前**的初始化部分，不修改原硬件工程。
+3. 保留该机资源分配、数据库加载、连接器、时钟、download、initialize 的原指令、参数及顺序。不同机器可能分别使用 `load_db -db ./hw.dat -to {b1.f0}`，或 `allocate -board {b1.f0}` → `load_db -release` → `load_db -db ./hw.dat`；必须按实测原文件准备，不能拼成统一模板。
+4. 文件结束时保持 `cpu_reset=1` 并用 `query -reset` 确认；删除应用写入/读回、`source write_image.tcl`、释放 CPU 复位、`exit` 等运行阶段内容。
+5. 在文件头注释记录来源服务器、原文件绝对路径和来源版本或 SHA-256，例如 `# Source host: fpga113`、`# Source path: /home/USER/Desktop/fpga-tester/user_script/hw_run/hw_run4.tcl`、`# Source SHA-256: ...`。硬件项目升级后须重新核对并正常重建会话。
+
+以上是**部署准备步骤**，scheduler 不会自动裁剪 `hw_runN.tcl` 或改写初始化文件。可提前为所有计划使用的端口准备并登记初始化文件；下例登记 FPGA4–7，只启用 FPGA6。旧的单端口映射配置仍可使用。
 
 ~~~bash
 cat > "$FPGA_DEPLOY_DIR/config.local.toml" <<'TOML'
@@ -49,14 +57,47 @@ profile = "nh-only"
 hardware_project = "/path/to/hardware-project"
 lock_dir = "/path/to/shared/scheduler-locks"
 
+[resident.init_scripts]
+"4" = "./init/init4.tcl"
+"5" = "./init/init5.tcl"
+"6" = "./init/init6.tcl"
+"7" = "./init/init7.tcl"
+
 [[nodes]]
 id = "local"
-ports = [4, 5]
+ports = [6]
 uvhs_shell = "/path/to/vendor/bin/uvhs2_shell"
 TOML
 ~~~
 
-编辑其中三个绝对路径再启动。相对路径以 config 所在目录为基准；TOML 内不展开 `~` 或 `$HOME`。同板其他 FPGA 可同时运行；服务复用已设置的 5.5296 MHz 时钟，时钟不一致且其他会话仍在使用时等待。`[resident] shared_clock_index` 默认 6，须与工程的 sys_clk 映射一致。保存环境变量：
+编辑其中三个绝对路径和初始化文件路径再启动。`[resident.init_scripts]` 的键是带引号的物理端口号，须覆盖 `ports` 的每个启用端口，允许额外登记未启用端口。初始化文件相对路径以 **config 所在目录**为基准，支持开头的 `~`，不展开 `$HOME` 等环境变量；其他配置路径仍以 config 所在目录为基准，不展开 `~`。
+
+加载配置时检查所有登记项的编号、路径及文件是否可读；所有文件都必须存在。Resident 只为 `ports` 中的端口校验 Tcl 内容、目标编号、NH profile 与共享时钟要求，并在每次重建会话时重新校验。`ports` 是唯一启用白名单：未启用端口不会创建会话、打开 UART、分配硬件、下载 bitstream 或执行脚本。缺少启用端口的映射、启用脚本不兼容或初始化失败时明确报错，不会回退到旧流程。
+
+脚本在每个常驻会话的**隔离工作目录**执行，`./hw.dat` 是指向 `hardware_project/hw.dat` 的链接；初始化文件自身所在目录不作为 cwd。不要假设 `./user_script/...` 指向原硬件工程；脚本需要的其他资源请使用明确可读的路径。scheduler 原样 `source` 配置脚本，保留 allocate、load_db、`-to`、时钟参数和顺序。`[resident] shared_clock_index` 默认 6，须与工程的 sys_clk 映射一致；共享时钟检查不能通过删改脚本绕过。旧 `resident.explicit_allocation`（包括 `false`）须删除，原分配逻辑移入部署初始化 Tcl；旧 bootstrap 不再使用。
+
+同板其他 FPGA 有 owner、booked 或受管会话时，必须只读确认该板 `shared_clock_index` 的实际频率为 NH 要求的 5529600 Hz，才允许原样执行初始化 Tcl；频率未知或不匹配时拒绝初始化。含时钟配置/commit 的脚本还要求同板 FPGA 信息完整；同板完整且没有其他活动端口时，允许脚本配置时钟。未含时钟配置的脚本始终要求现有频率已匹配。这些是频率兼容性检查，scheduler 不省略或改写脚本中的时钟命令，也不据此保证同频 commit 在硬件上没有瞬态影响。
+
+设备发现按 UVHS 实际返回的单元数量工作，不要求固定八个 FPGA。`ports` 是本机要管理的端口白名单，例如 `[4]`；编号保持 `B0.F0–F3 → 0–3`、`B1.F0–F3 → 4–7`，后续板依此递增，不按查询行顺序重新编号。配置的目标未出现在查询结果中时会明确报告缺失；同板信息不完整时不能据此修改共享时钟。每个配置端口仍须有对应 UART 和独立初始化 Tcl。
+
+一次初始化后保留同一 UVHS shell：每任务确认 CPU 复位、写入 bin、DDR 回读校验、释放复位、收集输出并判断完成、再次确认 CPU 复位。连续正常任务不重新下载 bitstream，也不执行完整 `hw_runN.tcl`。正常停止按清理流程释放资源并退出 shell；故障恢复需要重建会话时才重新执行配置的初始化 Tcl。
+
+登记好所有初始化文件后，切换端口只需用**旧配置先停止** daemon、确认目标空闲、修改 `ports` 后启动。例如在 fpga113 从 FPGA6 切到 FPGA7：
+
+~~~bash
+ssh fpga113
+cd ~/fpga-resident-deploy
+source ./env.sh
+fpga-scheduler daemon stop
+/bitstream/nanhu-ra/scripts/check_fpga.sh
+vim config.local.toml  # 仅将 ports = [6] 改为 ports = [7]
+fpga-scheduler daemon start
+fpga-scheduler daemon status
+~~~
+
+`init_scripts` 和 Tcl 文件无需随切换修改。最终须确认所选端口为 `READY`；目标占用、共享时钟不兼容或初始化错误仍会拒绝初始化，不能删除时钟命令绕过保护。
+
+保存环境变量：
 
 ~~~bash
 cat > "$FPGA_DEPLOY_DIR/env.sh" <<'SH'

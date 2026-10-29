@@ -31,9 +31,55 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(ports[4]['owner'], '')
         self.assertTrue(ports[2]['booked'])
         self.assertFalse(ports[4]['booked'])
-        for invalid in ('', output + '\n' + output.splitlines()[0], '\n'.join(output.splitlines()[:-1])):
-            with self.assertRaises(RuntimeError):
-                runtime.parse_fpgas(invalid)
+        with self.assertRaisesRegex(RuntimeError, '[Dd]uplicate'):
+            runtime.parse_fpgas(output + '\n' + output.splitlines()[0])
+
+    def test_uvhs_inventory_accepts_installed_units_without_assuming_two_full_boards(self):
+        for numbers in (range(8), range(4), range(4, 8), (4,), (0, 2, 7), range(8, 12), (40, 43)):
+            with self.subTest(numbers=tuple(numbers)):
+                output = '\n'.join(f'uvhs-0 B{number // 4} F{number % 4} on link down false'
+                                   for number in numbers)
+                ports = runtime.parse_fpgas(output)
+                self.assertEqual(set(ports), set(numbers))
+                for number in numbers:
+                    self.assertEqual(ports[number]['number'], number)
+                    self.assertEqual(ports[number]['board'], f'B{number // 4}')
+                    self.assertEqual(ports[number]['fpga'], f'F{number % 4}')
+
+    def test_uvhs_inventory_ignores_unrelated_shell_output(self):
+        output = '''Command: query -fpgas -all
+System Name Board FPGA Power Status Owner Booked
+----------- ----- ---- ----- ------ ----- ------
+[20:43:25] INFO: platform initialized
+uvhs-0 ready
+uvhs-0 B0 F2 off link down true
+uvhs-0 B0 F3 on link up false
+Command: exit
+'''
+        ports = runtime.parse_fpgas(output)
+        self.assertEqual(set(ports), {2, 3})
+        self.assertEqual(ports[2]['power'], 'off')
+        self.assertTrue(ports[2]['booked'])
+        self.assertEqual(ports[3]['owner'], '')
+
+    def test_uvhs_inventory_rejects_empty_table(self):
+        for output in ('', 'Command: query -fpgas -all\nSystem Name Board FPGA Power Status Owner Booked'):
+            with self.subTest(output=output), self.assertRaisesRegex(RuntimeError, '(?i)(no|empty|missing).*FPGA'):
+                runtime.parse_fpgas(output)
+
+    def test_uvhs_inventory_rejects_malformed_unit_rows_instead_of_hiding_them(self):
+        valid = 'uvhs-0 B0 F0 on link down false\n'
+        for row in (
+                'uvhs-0 B0 F1 on link down',
+                'uvhs-0 B0 F1 on link down false extra extra',
+                'uvhs-0 Bx F1 on link down false',
+                'uvhs-0 B0 F4 on link down false',
+                'uvhs-0 B0 F1 unknown link down false',
+                'uvhs-0 B0 F1 on disconnected down false',
+                'uvhs-0 B0 F1 on link unknown false',
+                'uvhs-0 B0 F1 on link up owner maybe'):
+            with self.subTest(row=row), self.assertRaisesRegex(RuntimeError, '(?i)(invalid|malformed).*FPGA'):
+                runtime.parse_fpgas(valid + row)
 
     def test_mapping_requires_release_before_exact_load(self):
         for number in range(8):
@@ -87,13 +133,49 @@ class RuntimeTests(unittest.TestCase):
             (scripts / 'hw_run4.tcl').write_text('load_db -release\nload_db -db ./hw.dat -to {b1.f0}\n')
             uart = root / 'uart4'
             uart.touch()
-            output = '\n'.join(f"uvhs-0 B{n//4} F{n%4} on link {'up other-user' if n==5 else 'down'} false" for n in range(8))
+            output = 'uvhs-0 B1 F0 on link down false\nuvhs-0 B1 F1 on link up other-user false'
             with patch.object(runtime, 'UART_PREFIX', str(root / 'uart')), \
                  patch.object(runtime.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=output)), \
                  patch.object(runtime.subprocess, 'check_output', return_value=''):
                 ports = runtime.inventory()
             self.assertFalse(ports[0]['available'])
             self.assertIn('board in use (shared clock)', ports[0]['reasons'])
+
+    def _inventory_with_installed_units(self, numbers, configured):
+        with tempfile.TemporaryDirectory() as root, patch.object(runtime, 'ROOT', Path(root)), \
+             patch.object(runtime, 'ORDER', configured):
+            root = Path(root)
+            scripts = root / 'user_script/hw_run'
+            scripts.mkdir(parents=True)
+            for number in configured:
+                (scripts / f'hw_run{number}.tcl').write_text(
+                    'load_db -release\nload_db -db ./hw.dat -to {b%d.f%d}\n' % divmod(number, 4))
+                (root / f'uart{number}').touch()
+            output = '\n'.join(f'uvhs-0 B{number // 4} F{number % 4} on link down false'
+                               for number in numbers)
+            with patch.object(runtime, 'UART_PREFIX', str(root / 'uart')), \
+                 patch.object(runtime.subprocess, 'run', return_value=types.SimpleNamespace(returncode=0, stdout=output)), \
+                 patch.object(runtime.subprocess, 'check_output', return_value=''):
+                return runtime.inventory()
+
+    def test_inventory_missing_unrelated_board_does_not_disable_configured_units(self):
+        for installed, configured in ((range(4), (0, 2)), (range(4, 8), (4,))):
+            with self.subTest(installed=tuple(installed), configured=configured):
+                ports = self._inventory_with_installed_units(installed, configured)
+                self.assertEqual([port['number'] for port in ports], list(configured))
+                self.assertTrue(all(port['available'] for port in ports), ports)
+
+    def test_inventory_partial_shared_board_cannot_approve_unchecked_clock_changes(self):
+        ports = self._inventory_with_installed_units((4,), (4,))
+        self.assertFalse(ports[0]['available'])
+        self.assertIn('board inventory incomplete', ports[0]['reasons'])
+
+    def test_inventory_missing_configured_unit_reports_unavailable_and_keeps_existing_unit(self):
+        ports = self._inventory_with_installed_units(range(4), (4, 0))
+        self.assertEqual([port['number'] for port in ports], [4, 0])
+        self.assertFalse(ports[0]['available'])
+        self.assertRegex(' '.join(ports[0]['reasons']), '(?i)(missing|not (?:present|reported|found))')
+        self.assertTrue(ports[1]['available'], ports[1])
 
     def test_timeout_terminates_real_stubborn_child_and_keeps_lock_until_retired(self):
         with tempfile.TemporaryDirectory() as root:

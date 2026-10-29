@@ -11,7 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 from fpga_scheduler.backends.resident import Resident
 from fpga_scheduler.config import Node, load
@@ -31,11 +31,15 @@ class ResidentTests(unittest.TestCase):
         self.project = self.root / 'project'
         (self.project / 'user_script/hw_run').mkdir(parents=True)
         (self.project / 'hw.dat').mkdir()
+        self.init_scripts = {}
+        (self.root / 'deployment/init').mkdir(parents=True)
         for p in (4, 5):
+            # Resident must not inspect or execute the full project run script.
             (self.project / 'user_script/hw_run' / f'hw_run{p}.tcl').write_text(
-                'load_db -release\nload_db -db ./hw.dat\nconfig -clock -frequency 5529600 sys_clk\n'
-                'config -clock -commit\nreset -name cpu_reset -value 1\n'
-                'download\ninitialize\nsource ./user_script/hw_run/write_image.tcl\n')
+                'error {full application hardware script must not be used}\nexit\n')
+            script = self.root / 'deployment/init' / f'init{p}.tcl'
+            script.write_text(self.initialization(p))
+            self.init_scripts[p] = script
         wrapper = self.root / 'uvhs'
         import shlex
         wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('tclsh')) + ' ' + shlex.quote(str(FIXTURE.resolve())) + ' "$@"\n')
@@ -48,7 +52,8 @@ class ResidentTests(unittest.TestCase):
             self.masters[p] = master
         self.node = Node('local', (4, 5), uvhs_shell=str(wrapper), uart_prefix=str(self.root / 'uart'))
         self.backend = Resident((self.node,), self.root / 'state', hardware_project=self.project,
-                                lock_dir=self.root / 'locks', startup_timeout=2, command_timeout=1,
+                                lock_dir=self.root / 'locks', init_scripts=self.init_scripts,
+                                startup_timeout=2, command_timeout=1,
                                 uart_quiet_seconds=.03, recovery_backoff=.01)
         self.images = Images(self.root / 'state/images')
         self.stop_emitter = threading.Event()
@@ -106,23 +111,119 @@ class ResidentTests(unittest.TestCase):
         ports = self.backend.probe('local')
         self.assertTrue(all(p['available'] for p in ports), ports)
 
-    def test_database_allocation_mode_does_not_allocate(self):
-        with patch.dict(os.environ, {'FAKE_REJECT_ALLOCATION': '1'}):
-            self.ready()
-            result = self.run_task(self.task(1))
-        self.assertEqual(result['exit_code'], 0, result)
+    @staticmethod
+    def initialization(port, *, explicit=False, clock=False):
+        target = f'b{port // 4}.f{port % 4}'
+        # These intentionally preserve each server's observed reference order.
+        allocation = (f'allocate -board {{{target}}}\nload_db -release\nload_db -db ./hw.dat\n'
+                      if explicit else f'load_db -release\nload_db -db ./hw.dat -to {{{target}}}\n')
+        clock_commands = ('config -clock -frequency 5529600 sys_clk\nconfig -clock -commit\n'
+                          if clock else '')
+        return ('# Deployment source: test reference; SHA-256 captured by Resident\n'
+                + allocation + clock_commands + 'reset -name cpu_reset -value 1\n'
+                'download\ninitialize\nreset -name cpu_reset -value 1\nquery -reset\n')
 
-    def test_explicit_allocation_mode_allocates_after_release(self):
-        self.backend.explicit_allocation = True
-        self.backend.bootstraps = {p: self.backend._bootstrap(p) for p in self.backend.node.ports}
-        with patch.dict(os.environ, {'FAKE_REQUIRE_ALLOCATION': '1'}):
+    def test_database_target_reference_executes_original_order_without_allocate(self):
+        original = self.init_scripts[4].read_bytes()
+        with patch.dict(os.environ, FAKE_REJECT_ALLOCATION='1'):
             self.ready()
             result = self.run_task(self.task(1))
         self.assertEqual(result['exit_code'], 0, result)
+        commands = (self.backend.sessions[4].directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands[:2], ['load_db -release', 'load_db -db ./hw.dat -to b1.f0'])
+        self.assertFalse(any(line.startswith('allocate ') for line in commands))
+        self.assertEqual(self.init_scripts[4].read_bytes(), original)
+
+    def test_explicit_reference_preserves_allocate_before_release_without_to(self):
+        self.init_scripts[4].write_text(self.initialization(4, explicit=True))
+        original = self.init_scripts[4].read_bytes()
+        with patch.dict(os.environ, FAKE_REQUIRE_ALLOCATION='1'):
+            self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+        result = self.run_task(self.task(1))
+        self.assertEqual(result['exit_code'], 0, result)
+        commands = (self.backend.sessions[4].directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands[:3], ['allocate -board b1.f0', 'load_db -release',
+                                       'load_db -db ./hw.dat'])
+        self.assertEqual(self.init_scripts[4].read_bytes(), original)
+
+    def test_source_snapshot_preserves_all_script_bytes_and_records_origin(self):
+        original = self.initialization(4).replace('\n', '\r\n').encode()
+        self.init_scripts[4].write_bytes(original)
+        self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+        session = self.backend.sessions[4]
+        self.assertEqual((session.directory / 'init.tcl').read_bytes(), original)
+        metadata = json.loads((session.directory / 'init-script.json').read_text())
+        self.assertEqual(metadata['source'], str(self.init_scripts[4]))
+        self.assertEqual(metadata['sha256'], hashlib.sha256(original).hexdigest())
+        self.assertTrue(session.reset())
+        self.assertFalse((session.directory / 'release').exists())
+
+    def test_initialization_errors_timeout_and_unconfirmed_reset_never_become_ready(self):
+        for fault in ('FAKE_INIT_ERROR', 'FAKE_INIT_REPORTED_ERROR',
+                      'FAKE_INIT_DELAY', 'FAKE_RESET_QUERY_ZERO'):
+            with self.subTest(fault=fault):
+                self.backend.options['startup_timeout'] = .1
+                with patch.dict(os.environ, {fault: '500' if fault == 'FAKE_INIT_DELAY' else '1'}):
+                    self.backend._initialize(4)
+                self.assertNotEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+                self.assertNotIn(4, self.backend.sessions)
+                self.assertIn('Initialization failed', self.backend.states[4]['reason'])
+                self.assertFalse((self.backend.root / 'ports/4/release').exists())
+                if fault == 'FAKE_INIT_ERROR':
+                    log = (self.backend.root / 'ports/4/control.log').read_text()
+                    self.assertIn('Scheduler Tcl error: injected initialization failure', log)
+                    self.assertIn('init.tcl', log)
+                    self.assertIn('initialize', log)
+        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+
+    def test_initializer_must_leave_reset_asserted_before_scheduler_reset_command(self):
+        # A source acknowledgement alone is insufficient. initialize can alter
+        # the signal, even if the script asserted it before bitstream download.
+        self.init_scripts[4].write_text(self.initialization(4).replace(
+            'initialize\nreset -name cpu_reset -value 1\nquery -reset\n', 'initialize\n'))
+        with patch.dict(os.environ, FAKE_INIT_RELEASE_CPU='1'):
+            self.backend._initialize(4)
+        self.assertNotEqual(self.backend.states[4]['state'], 'READY')
+        self.assertNotIn(4, self.backend.sessions)
+        self.assertIn('not confirmed', self.backend.states[4]['reason'])
+        commands = (self.backend.root / 'ports/4/control-commands').read_text().splitlines()
+        after_initialize = commands.index('initialize') + 1
+        self.assertEqual(commands[after_initialize], 'query -reset')
+        self.assertFalse((self.backend.root / 'ports/4/release').exists())
+
+    def test_reinitialize_rereads_deployment_script_and_replaces_snapshot(self):
+        self.backend._initialize(4)
+        old = self.backend.sessions[4]
+        original_snapshot = (old.directory / 'init.tcl').read_bytes()
+        changed = self.initialization(4, explicit=True).replace('# Deployment source:', '# Updated source:')
+        self.init_scripts[4].write_text(changed)
+        # An already running shell keeps its initialized state until rebuilt.
+        self.assertEqual((old.directory / 'init.tcl').read_bytes(), original_snapshot)
+        self.assertEqual(self.run_task(self.task(1))['exit_code'], 0)
+        self.backend._initialize(4)
+        current = self.backend.sessions[4]
+        self.assertIsNot(current, old)
+        self.assertNotEqual(current.epoch, old.epoch)
+        self.assertIsNotNone(old.process.poll())
+        self.assertEqual((current.directory / 'init.tcl').read_bytes(), changed.encode())
+        self.assertEqual(self.run_task(self.task(2))['exit_code'], 0)
+        commands = (current.directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands.count('allocate -board b1.f0'), 1)
+        self.assertEqual((current.directory / 'downloads').read_text().count('download'), 2)
+
+    def test_missing_initialization_file_during_recovery_never_uses_project_script(self):
+        self.backend._initialize(4)
+        self.init_scripts[4].unlink()
+        self.backend._initialize(4)
+        self.assertNotEqual(self.backend.states[4]['state'], 'READY')
+        self.assertIn('init4.tcl', self.backend.states[4]['reason'])
 
     def test_same_session_a_b_a_and_stale_uart_boundary(self):
         self.ready()
-        epoch = self.backend.sessions[4].epoch
+        session = self.backend.sessions[4]
+        epoch, pid = session.epoch, session.process.pid
         for i, mode in enumerate(('A', 'B', 'A'), 1):
             if i == 2:
                 os.write(self.masters[4], b'@@FPGA_START {"version":1}\n@@FPGA_RESULT {"version":1,"status":"exited","app_exit_code":7}\n')
@@ -130,8 +231,22 @@ class ResidentTests(unittest.TestCase):
             self.assertEqual(result['exit_code'], 0, result)
             self.assertIn('\n' + mode + '\n', result['uart_output'])
             self.assertEqual(result['details']['session'], epoch)
+            self.assertEqual(result['details']['uvhs_pid'], pid)
             self.assertTrue(result['details']['reset_confirmed'])
         self.assertEqual((self.backend.root / 'ports/4/downloads').read_text().count('download'), 1)
+        commands = (session.directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands.count('initialize'), 1)
+        self.assertEqual(sum(line.startswith('load_db -db ') for line in commands), 1)
+        writes = [i for i, line in enumerate(commands) if line.startswith('writemem ')]
+        self.assertEqual(len(writes), 3)
+        for start, end in zip(writes, writes[1:] + [len(commands)]):
+            self.assertEqual(commands[start - 2:start], ['reset -name cpu_reset -value 1', 'query -reset'])
+            task_commands = commands[start:end]
+            readback = next(i for i, line in enumerate(task_commands) if line.startswith('readmem '))
+            release = task_commands.index('reset -name cpu_reset -value 0')
+            self.assertLess(readback, release)
+            self.assertIn('reset -name cpu_reset -value 1', task_commands[release + 1:])
+            self.assertEqual(task_commands[-1], 'query -reset')
 
     def test_signed_exit_trap_duplicate_and_false_pass(self):
         self.ready()
@@ -492,6 +607,47 @@ class ResidentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'whitelist'):
             self.backend.run(self.task(1), 'local', 6)
 
+    def test_single_reported_board_initializes_and_runs_configured_ports(self):
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7'):
+            self.ready()
+            result = self.run_task(self.task(1))
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertEqual(set(self.backend.sessions), {4, 5})
+        self.assertTrue(all(not (s.directory / 'clock-configs').exists()
+                            for s in self.backend.sessions.values()))
+
+    def test_missing_target_does_not_prevent_other_target_with_verified_clock(self):
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4'):
+            ports = self.backend.probe('local')
+        self.assertTrue(ports[0]['available'], ports)
+        self.assertFalse(ports[1]['available'])
+        self.assertIn('FPGA5 (B1.F1) missing from UVHS inventory', ports[1]['reasons'][0])
+        self.assertEqual(set(self.backend.sessions), {4})
+        self.assertFalse((self.backend.root / 'ports/5').exists())
+        self.assertFalse((self.backend.sessions[4].directory / 'clock-configs').exists())
+
+    def test_absent_target_is_reported_before_any_uart_or_clock_operation(self):
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='0 1 2 3'), \
+             patch.object(self.backend, '_uart_busy') as uart, \
+             patch.object(self.backend, '_clocks') as clocks:
+            self.backend._initialize(4)
+        uart.assert_not_called()
+        clocks.assert_not_called()
+        self.assertIn('FPGA4 (B1.F0) missing from UVHS inventory', self.backend.states[4]['reason'])
+        self.assertIn('reported FPGA units: 0, 1, 2, 3', self.backend.states[4]['reason'])
+        self.assertFalse(self.backend.sessions)
+
+    def test_incomplete_target_board_never_reconfigures_shared_clock(self):
+        self.init_scripts[4].write_text(self.initialization(4, clock=True))
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4'), \
+             patch.object(self.backend, '_clocks', return_value={(1, 6): 5529600}):
+            self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+        self.assertEqual(self.backend.states[4]['attempts'], 0)
+        self.assertIn('inventory missing FPGA5, FPGA6, FPGA7', self.backend.states[4]['reason'])
+        self.assertFalse(self.backend.sessions)
+        self.assertFalse((self.backend.root / 'ports/4').exists())
+
     def test_initialization_does_not_wait_for_busy_managed_sibling(self):
         with self.backend.guard:
             self.backend._initialize(5)
@@ -517,41 +673,185 @@ class ResidentTests(unittest.TestCase):
 
     def test_shared_board_clock_mismatch_or_unknown_blocks_without_download(self):
         physical = {p: dict(owner='foreign' if p == 7 else '', booked=False, power='on') for p in range(8)}
-        for clocks in ({(1, 6): 14745600}, {(0, 6): 5529600}, {}):
-            with self.subTest(clocks=clocks), patch.object(self.backend, '_physical', return_value=physical), \
-                    patch.object(self.backend, '_clocks', return_value=clocks):
-                self.backend._initialize(4)
-                self.assertFalse(self.backend.sessions)
-                self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
-                self.assertEqual(self.backend.states[4]['attempts'], 0)
-                self.assertIn('expected 5529600 Hz', self.backend.states[4]['reason'])
-                self.assertIn('FPGA7 active', self.backend.states[4]['reason'])
-                self.assertFalse((self.backend.root / 'ports/4/downloads').exists())
+        for clock_script in (False, True):
+            self.init_scripts[4].write_text(self.initialization(4, clock=clock_script))
+            for clocks in ({(1, 6): 14745600}, {(0, 6): 5529600}, {}):
+                with self.subTest(clock_script=clock_script, clocks=clocks), \
+                        patch.object(self.backend, '_physical', return_value=physical), \
+                        patch.object(self.backend, '_clocks', return_value=clocks), \
+                        patch('fpga_scheduler.backends.resident.Session') as session, \
+                        patch.object(self.backend, '_lock', wraps=self.backend._lock) as lock:
+                    self.backend._initialize(4)
+                    session.assert_not_called()
+                    self.assertNotIn(call('fpga4.lock'), lock.call_args_list)
+                    self.assertFalse(self.backend.sessions)
+                    self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+                    self.assertEqual(self.backend.states[4]['attempts'], 0)
+                    self.assertIn('expected 5529600 Hz', self.backend.states[4]['reason'])
+                    self.assertIn('FPGA7 active', self.backend.states[4]['reason'])
+                    self.assertFalse((self.backend.root / 'ports/4').exists())
 
-    def test_empty_board_can_configure_clock_and_environment_cannot_override_profile(self):
-        path = self.project / 'user_script/hw_run/hw_run4.tcl'
-        path.write_text(path.read_text().replace(
-            'config -clock -frequency 5529600 sys_clk',
-            'set sys_clk_hz 5529600\n'
-            'if {[info exists ::env(UV_RUN_SYS_CLK_HZ)]} {set sys_clk_hz $::env(UV_RUN_SYS_CLK_HZ)}\n'
-            'config -clock -frequency $sys_clk_hz sys_clk'))
-        self.backend.bootstraps[4] = self.backend._bootstrap(4)
-        with patch.object(self.backend, '_clocks', return_value={(1, 6): 16260162}), \
-                patch.dict(os.environ, UV_RUN_SYS_CLK_HZ='14745600'):
+    def test_empty_board_executes_explicit_clock_commands_without_changes(self):
+        self.init_scripts[4].write_text(self.initialization(4, clock=True))
+        with patch.object(self.backend, '_clocks', return_value={(1, 6): 16260162}):
             self.backend._initialize(4)
-        self.assertEqual(self.backend.states[4]['state'], 'READY')
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
         commands = (self.backend.sessions[4].directory / 'clock-configs').read_text()
-        self.assertIn('-frequency 5529600 sys_clk', commands)
-        self.assertIn('-commit', commands)
-        self.assertNotIn('14745600', commands)
+        self.assertEqual(commands.splitlines(), ['-clock -frequency 5529600 sys_clk', '-clock -commit'])
+
+    def test_matching_shared_clock_executes_original_script_with_owned_or_booked_sibling(self):
+        # Match the deployed allocate -> release -> load sequence, including
+        # clock commands; sibling occupancy alone must not reject this script.
+        self.init_scripts[4].write_text(self.initialization(4, explicit=True, clock=True))
+        original = self.init_scripts[4].read_bytes()
+        for ownership in (dict(owner='foreign', booked=False), dict(owner='', booked=True)):
+            physical = {p: dict(owner='', booked=False, power='on') for p in range(8)}
+            physical[6].update(ownership)
+            with self.subTest(**ownership), patch.object(self.backend, '_physical', return_value=physical):
+                self.backend._initialize(4)
+                self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+                self.assertEqual(set(self.backend.sessions), {4})
+                session = self.backend.sessions[4]
+                self.assertEqual((session.directory / 'init.tcl').read_bytes(), original)
+                commands = (session.directory / 'control-commands').read_text().splitlines()
+                self.assertEqual(commands[:5], [
+                    'allocate -board b1.f0', 'load_db -release', 'load_db -db ./hw.dat',
+                    'config -clock -frequency 5529600 sys_clk', 'config -clock -commit'])
+                self.assertTrue(session.reset())
+                self.assertFalse((self.backend.root / 'ports/6').exists())
+        self.assertEqual(self.init_scripts[4].read_bytes(), original)
+
+    def test_matching_shared_clock_accepts_clock_script_with_active_managed_session(self):
+        self.backend._initialize(5)
+        sibling = self.backend.sessions[5]
+        sibling_pid = sibling.process.pid
+        sibling_downloads = sibling.downloads
+        self.init_scripts[4].write_text(self.initialization(4, clock=True))
+        self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+        self.assertIs(self.backend.sessions[5], sibling)
+        self.assertEqual(sibling.process.pid, sibling_pid)
+        self.assertEqual(sibling.downloads, sibling_downloads)
+        commands = (self.backend.sessions[4].directory / 'clock-configs').read_text()
+        self.assertEqual(commands.splitlines(), ['-clock -frequency 5529600 sys_clk', '-clock -commit'])
+        self.assertTrue(sibling.reset())
+
+    def test_fpga113_reference_initialization_then_two_jobs_reuse_same_shell(self):
+        # Executable initialization steps read from fpga113's make uv_run4
+        # reference hw_run4.tcl (SHA-256 2fcb89cf9291f788f1c9bdb740c301f0
+        # 453a6e866c41c02d5d883ecb561eea76). Deployment appends reset/query
+        # instead of the application-stage source/reset release.
+        source = ('query -user\nquery -fpgas -all\nquery -version\n'
+                  'allocate -board {b1.f0}\nload_db -release\nload_db -db ./hw.dat\n'
+                  'config -connector\nquery -connector -type fmc\nquery -voltage\n'
+                  'set sys_clk_hz 5529600\n'
+                  'if {[info exists ::env(UV_RUN_SYS_CLK_HZ)]} {\n'
+                  '  set sys_clk_hz $::env(UV_RUN_SYS_CLK_HZ)\n}\n'
+                  'config -clock -frequency $sys_clk_hz sys_clk\n'
+                  'config -clock -commit\nquery -clock\n'
+                  'reset -name cpu_reset -value 1\nquery -reset\n'
+                  'download\nquery -ipinfo\ninitialize\n'
+                  'reset -name cpu_reset -value 1\nquery -reset\n')
+        self.init_scripts[4].write_text(source)
+        physical = {p: dict(owner='foreign' if p in (5, 6, 7) else '',
+                            booked=False, power='on') for p in (4, 5, 6, 7)}
+        with patch.object(self.backend, '_physical', return_value=physical), \
+                patch.dict(os.environ, UV_RUN_SYS_CLK_HZ='5529600', FAKE_REQUIRE_ALLOCATION='1'):
+            self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+        session = self.backend.sessions[4]
+        pid = session.process.pid
+        for ident in (1, 2):
+            result = self.run_task(self.task(ident))
+            self.assertEqual(result['exit_code'], 0, result)
+            self.assertTrue(result['details']['reset_confirmed'])
+            self.assertIs(self.backend.sessions[4], session)
+            self.assertEqual(session.process.pid, pid)
+        self.assertEqual((session.directory / 'init.tcl').read_bytes(), source.encode())
+        commands = (session.directory / 'control-commands').read_text().splitlines()
+        expected = ['query -user', 'query -fpgas -all', 'query -version',
+                    'allocate -board b1.f0', 'load_db -release', 'load_db -db ./hw.dat',
+                    'config -connector', 'query -connector -type fmc', 'query -voltage',
+                    'config -clock -frequency 5529600 sys_clk', 'config -clock -commit',
+                    'query -clock', 'reset -name cpu_reset -value 1', 'query -reset',
+                    'download', 'query -ipinfo', 'initialize',
+                    'reset -name cpu_reset -value 1', 'query -reset']
+        self.assertEqual(commands[:len(expected)], expected)
+        self.assertEqual(commands.count('initialize'), 1)
+        self.assertEqual(commands.count('download'), 1)
+        self.assertEqual(sum(line.startswith('writemem ') for line in commands), 2)
+        self.assertEqual(sum(line.startswith('readmem ') for line in commands), 2)
+        self.assertEqual(session.downloads, 1)
+        self.assertEqual(set(self.backend.sessions), {4})
+
+    def test_other_board_ownership_does_not_block_clock_initialization(self):
+        self.init_scripts[4].write_text(self.initialization(4, clock=True))
+        physical = {p: dict(owner='foreign' if p == 0 else '', booked=False, power='on') for p in range(8)}
+        with patch.object(self.backend, '_physical', return_value=physical), \
+                patch.object(self.backend, '_clocks', return_value={(1, 6): 11059200}):
+            self.backend._initialize(4)
+        self.assertEqual(self.backend.states[4]['state'], 'READY', self.backend.states[4])
+        self.assertEqual(set(self.backend.sessions), {4})
+        commands = (self.backend.sessions[4].directory / 'clock-configs').read_text()
+        self.assertEqual(commands.splitlines(), ['-clock -frequency 5529600 sys_clk', '-clock -commit'])
+
+    def test_stop_during_first_port_initialization_does_not_start_next_port(self):
+        entered, release = threading.Event(), threading.Event()
+
+        def initialize(number):
+            entered.set()
+            release.wait(2)
+
+        with patch.object(self.backend, '_initialize', side_effect=initialize) as initialize:
+            worker = threading.Thread(target=self.backend.probe, args=('local',))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                self.backend.stop_initialization()
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(initialize.call_args_list, [call(4)])
+
+    def test_stop_during_clock_query_cancels_new_session_but_allows_existing_task_to_drain(self):
+        self.backend._initialize(4)
+        session = self.backend.sessions[4]
+        entered, release = threading.Event(), threading.Event()
+
+        def clocks():
+            entered.set()
+            release.wait(2)
+            return {(1, 6): 5529600}
+
+        with patch.object(self.backend, '_clocks', side_effect=clocks), \
+                patch('fpga_scheduler.backends.resident.Session') as new_session:
+            worker = threading.Thread(target=self.backend.probe, args=('local',))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                # This call must return while probe still owns Resident.guard.
+                self.backend.stop_initialization()
+            finally:
+                release.set()
+                worker.join(2)
+            self.assertFalse(worker.is_alive())
+            new_session.assert_not_called()
+        self.assertEqual(set(self.backend.sessions), {4})
+        self.assertFalse((self.backend.root / 'ports/5').exists())
+        self.assertEqual(self.backend.states[5]['reason'], 'Service is stopping')
+        result = self.run_task(self.task(1))
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertIs(self.backend.sessions[4], session)
 
     def test_live_clock_parser_uses_physical_board_and_rejects_duplicates(self):
         output = ('Board Index Frequency(MHz) Clock Signal Name Type\n'
                   'B0 6 16.260162 NA PLL\nB1 6 5.529600 NA PLL\n'
-                  'B1 7 14.745600 NA PLL\n')
+                  'B1 7 14.745600 NA PLL\nB10 6 5.529600 NA PLL\n')
         with patch.object(self.backend, '_hardware_query', return_value=output):
             clocks = self.backend._clocks()
-            self.assertEqual(set(clocks), {(0, 6), (1, 6), (1, 7)})
+            self.assertEqual(set(clocks), {(0, 6), (1, 6), (1, 7), (10, 6)})
+            self.assertAlmostEqual(clocks[10, 6], 5529600)
             for key, expected in {(0, 6): 16260162, (1, 6): 5529600, (1, 7): 14745600}.items():
                 self.assertAlmostEqual(clocks[key], expected)
         with patch.object(self.backend, '_hardware_query', return_value=output + 'B1 6 5.529600 NA PLL\n'):
@@ -786,7 +1086,7 @@ class ResidentTests(unittest.TestCase):
             protected.extend((work / 'image.bin', work / 'readback.bin'))
         self.backend.close()
         self.backend = Resident((self.node,), self.root / 'state', hardware_project=self.project,
-                                lock_dir=self.root / 'locks')
+                                lock_dir=self.root / 'locks', init_scripts=self.init_scripts)
         self.assertFalse((directory / 'image.bin').exists())
         self.assertFalse((directory / 'readback.bin').exists())
         self.assertAlmostEqual(directory.stat().st_mtime, old, places=5)
@@ -795,6 +1095,140 @@ class ResidentTests(unittest.TestCase):
         self.assertTrue(all(p.read_bytes() == b'keep' for p in protected))
         recovered = self.backend.recover(dict(id=payload['id'], payload=json.dumps(payload), node='local', fpga=4))
         self.assertEqual(recovered, result)
+
+
+@unittest.skipUnless(shutil.which('tclsh'), 'tclsh required for resident control protocol')
+class RegisteredInitializationTests(unittest.TestCase):
+    """Registration is passive; only the node whitelist may touch hardware."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.project = self.root / 'project'
+        (self.project / 'hw.dat').mkdir(parents=True)
+        scripts = self.root / 'deployment/init'
+        scripts.mkdir(parents=True)
+        self.init_scripts = {}
+        for number in range(4, 8):
+            path = scripts / f'init{number}.tcl'
+            path.write_text(ResidentTests.initialization(number, explicit=number == 6))
+            self.init_scripts[number] = path
+        import shlex
+        self.wrapper = self.root / 'uvhs'
+        self.wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(shutil.which('tclsh'))
+                                + ' ' + shlex.quote(str(FIXTURE.resolve())) + ' "$@"\n')
+        self.wrapper.chmod(0o755)
+        # Disabled FPGA4/5 deliberately have no UART devices at all.
+        for number in (6, 7):
+            master, slave = pty.openpty()
+            self.addCleanup(os.close, master)
+            (self.root / f'uart{number}').symlink_to(os.ttyname(slave))
+            os.close(slave)
+
+    def resident(self, number, *, scripts=None):
+        node = Node('local', (number,), uvhs_shell=str(self.wrapper),
+                    uart_prefix=str(self.root / 'uart'))
+        backend = Resident((node,), self.root / 'state', hardware_project=self.project,
+                           lock_dir=self.root / 'locks',
+                           init_scripts=self.init_scripts if scripts is None else scripts,
+                           startup_timeout=2, command_timeout=1, uart_quiet_seconds=.03)
+        self.addCleanup(backend.close)
+        return backend
+
+    def test_full_registration_only_initializes_enabled_fpga(self):
+        from fpga_scheduler.remote.init_script import load_init_script
+        from fpga_scheduler.remote.uvhs_session import Session
+        real_open = os.open
+        with patch('fpga_scheduler.backends.resident.load_init_script', wraps=load_init_script) as load_script, \
+             patch('fpga_scheduler.backends.resident.Session', wraps=Session) as sessions, \
+             patch('fpga_scheduler.remote.uvhs_session.os.open', wraps=real_open) as opens, \
+             patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7'):
+            backend = self.resident(6)
+            with patch.object(backend, '_uart_busy', wraps=backend._uart_busy) as uart:
+                ports = backend.probe('local')
+            self.assertEqual([call.args[0] for call in uart.call_args_list], [6])
+        self.assertEqual(backend.init_scripts, self.init_scripts)
+        self.assertEqual(set(backend.states), {6})
+        self.assertEqual(set(backend.sessions), {6})
+        self.assertEqual([(port['number'], port['available']) for port in ports], [(6, True)])
+        self.assertEqual([call.args[1] for call in load_script.call_args_list], [6, 6])
+        self.assertEqual([call.args[1] for call in sessions.call_args_list], [6])
+        uart_paths = [str(call.args[0]) for call in opens.call_args_list
+                      if str(call.args[0]).startswith(str(self.root / 'uart'))]
+        self.assertEqual(uart_paths, [str(self.root / 'uart6')])
+        self.assertEqual({path.name for path in (backend.root / 'ports').iterdir()}, {'6'})
+        session = backend.sessions[6]
+        commands = (session.directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands[:3], ['allocate -board b1.f2', 'load_db -release',
+                                       'load_db -db ./hw.dat'])
+        self.assertEqual(commands.count('download'), 1)
+        self.assertEqual(commands.count('initialize'), 1)
+        self.assertEqual((session.directory / 'init.tcl').read_bytes(), self.init_scripts[6].read_bytes())
+
+    def test_disabled_content_and_targets_are_not_read_or_executed_until_enabled(self):
+        self.init_scripts[4].write_text('error disabled_script_must_never_run\nexit\n')
+        self.init_scripts[5].write_text(ResidentTests.initialization(7))
+        self.init_scripts[7].write_bytes(b'\xff invalid UTF-8 Tcl\n')
+        real_read_bytes = Path.read_bytes
+
+        def enabled_only(path):
+            self.assertNotIn(path, [self.init_scripts[p] for p in (4, 5, 7)],
+                             'Disabled initializer content was read')
+            return real_read_bytes(path)
+
+        with patch.object(Path, 'read_bytes', enabled_only):
+            backend = self.resident(6)
+            ports = backend.probe('local')
+        self.assertEqual([(port['number'], port['available']) for port in ports], [(6, True)])
+        backend.close()
+        for number, message in ((4, 'unsupported initialization command'),
+                                (5, 'must match FPGA5'), (7, 'readable UTF-8')):
+            with self.subTest(number=number), \
+                 patch('fpga_scheduler.backends.resident.Session') as sessions, \
+                 patch('fpga_scheduler.backends.resident.retire_record') as retire:
+                with self.assertRaisesRegex(ValueError, message):
+                    self.resident(number)
+                sessions.assert_not_called()
+                retire.assert_not_called()
+                self.assertFalse((backend.root / 'ports' / str(number)).exists())
+
+    def test_missing_enabled_mapping_is_rejected_before_session_retirement(self):
+        scripts = {number: path for number, path in self.init_scripts.items() if number != 6}
+        with patch('fpga_scheduler.backends.resident.Session') as sessions, \
+             patch('fpga_scheduler.backends.resident.retire_record') as retire:
+            with self.assertRaisesRegex(ValueError, 'init_scripts.*6'):
+                self.resident(6, scripts=scripts)
+        sessions.assert_not_called()
+        retire.assert_not_called()
+        self.assertFalse((self.root / 'state/resident/ports').exists())
+
+    def test_clean_stop_switches_six_to_seven_using_unchanged_registration(self):
+        originals = {number: path.read_bytes() for number, path in self.init_scripts.items()}
+        first = self.resident(6)
+        self.assertTrue(first.probe('local')[0]['available'])
+        old = first.sessions[6]
+        first.close()
+        self.assertIsNotNone(old.process.poll())
+        self.assertTrue(json.loads(old.record.read_text())['closed_cleanly'])
+
+        second = self.resident(7)
+        ports = second.probe('local')
+        self.assertEqual([(port['number'], port['available']) for port in ports], [(7, True)])
+        self.assertEqual(second.init_scripts, first.init_scripts)
+        self.assertEqual(set(second.states), {7})
+        self.assertEqual(set(second.sessions), {7})
+        current = second.sessions[7]
+        self.assertNotEqual(current.epoch, old.epoch)
+        commands = (current.directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands[:2], ['load_db -release', 'load_db -db ./hw.dat -to b1.f3'])
+        self.assertFalse(any(line.startswith('allocate ') for line in commands))
+        self.assertEqual(commands.count('download'), 1)
+        self.assertEqual(commands.count('initialize'), 1)
+        self.assertEqual((old.directory / 'init.tcl').read_bytes(), originals[6])
+        self.assertEqual((current.directory / 'init.tcl').read_bytes(), originals[7])
+        self.assertEqual({number: path.read_bytes() for number, path in self.init_scripts.items()}, originals)
+        self.assertEqual({path.name for path in (second.root / 'ports').iterdir()}, {'6', '7'})
 
 
 class LogTests(unittest.TestCase):
@@ -848,23 +1282,29 @@ class RecoveryAndQuotaTests(unittest.TestCase):
 
     def test_resident_configuration_rejects_ssh_and_bad_options(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'config.toml'
+            root = Path(tmp)
+            (root / 'init').mkdir()
+            for port in (4, 5):
+                (root / 'init' / f'init{port}.tcl').write_text(ResidentTests.initialization(port))
+            path = root / 'config.toml'
+            scripts = '[resident.init_scripts]\n"4"="init/init4.tcl"\n"5"="init/init5.tcl"\n'
             base = ('backend="bosc-resident"\nstate_dir="state"\ntoken_file="token"\n'
                     '[resident]\nhardware_project="project"\nlock_dir="locks"\n'
-                    '[[nodes]]\nid="local"\nports=[4,5]\nuvhs_shell="/vendor/uvhs"\n')
+                    + scripts + '[[nodes]]\nid="local"\nports=[4,5]\nuvhs_shell="/vendor/uvhs"\n')
             path.write_text(base)
             self.assertEqual(load(path).nodes[0].ports, (4,5))
             path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nshared_clock_index=0'))
             self.assertEqual(load(path).resident['shared_clock_index'], 0)
-            path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=true'))
-            self.assertTrue(load(path).resident['explicit_allocation'])
+            for legacy in ('true', 'false', '1'):
+                path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=' + legacy))
+                with self.assertRaisesRegex(ValueError, 'explicit_allocation.*init_scripts'):
+                    load(path)
             path.write_text(base.replace('lock_dir="locks"', 'lock_dir="locks"\nkeep_load_files=true\nstorage_retry_seconds=0.5'))
             self.assertTrue(load(path).resident['keep_load_files'])
             self.assertEqual(load(path).resident['storage_retry_seconds'], .5)
             for bad in (base + 'ssh_host="remote"\n', base.replace('ports=[4,5]', 'ports=[4,4]'),
                         base.replace('hardware_project="project"', 'profile="dma"\nhardware_project="project"'),
                         base.replace('lock_dir="locks"', 'lock_dir="locks"\nrecovery_attempts=1.5'),
-                        base.replace('lock_dir="locks"', 'lock_dir="locks"\nexplicit_allocation=1'),
                         base.replace('lock_dir="locks"', 'lock_dir="locks"\nkeep_load_files=1'),
                         *(base.replace('lock_dir="locks"', 'lock_dir="locks"\nstorage_retry_seconds=' + value)
                           for value in ('0', '-1', 'true')),
@@ -873,3 +1313,86 @@ class RecoveryAndQuotaTests(unittest.TestCase):
                 path.write_text(bad)
                 with self.assertRaises(ValueError):
                     load(path)
+            path.write_text(base.replace(scripts, ''))
+            with self.assertRaisesRegex(ValueError, 'init_scripts.*required'):
+                load(path)
+            for invalid_scripts in (
+                scripts.replace('"5"="init/init5.tcl"\n', ''),
+                scripts.replace('"4"=', '"04"='),
+                scripts.replace('init/init4.tcl', 'missing.tcl'),
+                scripts.replace('init/init4.tcl', 'init'),
+                scripts.replace('init/init4.tcl', '$INIT_SCRIPT'),
+                scripts.replace('"init/init4.tcl"', '4'),
+                scripts.replace('init/init4.tcl', ''),
+            ):
+                with self.subTest(invalid_scripts=invalid_scripts):
+                    path.write_text(base.replace(scripts, invalid_scripts))
+                    with self.assertRaisesRegex(ValueError, 'init_scripts'):
+                        load(path)
+
+    def test_initialization_paths_resolve_relative_to_config_and_preserve_absolute_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deployment = root / 'deployment'
+            deployment.mkdir()
+            relative = deployment / 'init4.tcl'
+            absolute = root / 'init5.tcl'
+            for port, script in ((4, relative), (5, absolute)):
+                script.write_text(ResidentTests.initialization(port))
+            config = deployment / 'config.toml'
+            config.write_text('backend="bosc-resident"\nstate_dir="state"\ntoken_file="token"\n'
+                              '[resident]\nhardware_project="project"\nlock_dir="locks"\n'
+                              '[resident.init_scripts]\n"4"="./init4.tcl"\n'
+                              f'"5"="{absolute}"\n'
+                              '[[nodes]]\nid="local"\nports=[4,5]\nuvhs_shell="/vendor/uvhs"\n')
+            loaded = load(config)
+            self.assertEqual(loaded.resident['init_scripts'], {4: str(relative), 5: str(absolute)})
+            self.assertEqual(loaded.resident['hardware_project'], str(deployment / 'project'))
+
+
+class InitializationScriptTests(unittest.TestCase):
+    def test_contract_rejects_application_commands_and_incompatible_targets_or_clocks(self):
+        from fpga_scheduler.remote.init_script import load_init_script
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'init4.tcl'
+            valid = ResidentTests.initialization(4, clock=True)
+            invalid = {
+                'application write': valid + 'writemem -file image.bin i_ddr\n',
+                'application read': valid + 'readmem -file result.bin i_ddr\n',
+                'application source': valid + 'source ./user_script/hw_run/write_image.tcl\n',
+                'CPU release': valid + 'reset -name cpu_reset -value 0\n',
+                'shell close': valid + 'exit\n',
+                'wrong FPGA': valid.replace('b1.f0', 'b1.f1'),
+                'wrong clock': valid.replace('5529600', '11059200'),
+                'wrong clock signal': valid.replace('sys_clk', 'another_clk'),
+                'missing bitstream download': valid.replace('download\n', ''),
+                'missing initialize': valid.replace('initialize\n', ''),
+                'no reset assertion': valid.replace('reset -name cpu_reset -value 1\n', ''),
+                'dynamic hidden command': valid + 'eval {reset -name cpu_reset -value 0}\n',
+                'command chaining': valid + 'query -reset; reset -name cpu_reset -value 0\n',
+            }
+            for case, text in invalid.items():
+                with self.subTest(case=case):
+                    path.write_text(text)
+                    with self.assertRaises(ValueError):
+                        load_init_script(path, 4)
+
+    def test_clock_environment_override_is_validated_without_changing_script(self):
+        from fpga_scheduler.remote.init_script import load_init_script
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'init4.tcl'
+            text = ResidentTests.initialization(4, clock=True).replace(
+                'config -clock -frequency 5529600 sys_clk',
+                'set sys_clk_hz 5529600\n'
+                'if {[info exists ::env(UV_RUN_SYS_CLK_HZ)]} {\n'
+                '    set sys_clk_hz $::env(UV_RUN_SYS_CLK_HZ)\n}\n'
+                'config -clock -frequency $sys_clk_hz sys_clk')
+            path.write_text(text)
+            with patch.dict(os.environ, UV_RUN_SYS_CLK_HZ='5529600'):
+                loaded = load_init_script(path, 4)
+            self.assertEqual(loaded.content, text.encode())
+            self.assertTrue(loaded.configures_clock)
+            with patch.dict(os.environ, UV_RUN_SYS_CLK_HZ='14745600'):
+                with self.assertRaises(ValueError):
+                    load_init_script(path, 4)
+            self.assertEqual(path.read_text(), text)

@@ -16,12 +16,9 @@ hardware_project = "/path/to/existing-hardware-project"
 # Shared with every legacy/resident deployment that can operate these ports.
 # Administrator provisions directory access for the service account.
 lock_dir = "/path/to/shared/scheduler-locks"
-# Enable only when UVHS requires explicit allocate, rather than load_db -to.
-# Both allocation styles cannot be mixed among active users of one UVHS server.
-explicit_allocation = false
 # Physical clock output used by sys_clk; verify against the hardware project.
-# Matching 5.5296 MHz is reused without clock reconfiguration, even when
-# sibling FPGAs have active sessions. A mismatch waits while siblings are busy.
+# The initialization Tcl must agree with the NH profile and this clock index.
+# Original Tcl commands are never removed to work around a shared clock conflict.
 shared_clock_index = 6
 startup_timeout = 300
 command_timeout = 60
@@ -44,8 +41,28 @@ output_ddr_bytes = 4194304
 # Aggregate exported bytes per task, at most 16 MiB / 16 named outputs.
 max_output_bytes = 16777216
 
+# Register deployment-owned initialization Tcl files in advance. Every enabled
+# nodes.ports entry needs a mapping; extra inactive entries are allowed.
+# All registered paths must exist and be readable when loading the config.
+# Only enabled ports undergo Tcl content/target/profile validation and session
+# initialization; inactive ports never open UART or perform hardware operations.
+# Relative paths use this TOML file's directory; leading ~ expands to the daemon
+# user's home. Environment variables such as $HOME are not expanded.
+# Scripts execute from each isolated session directory, where ./hw.dat links to
+# hardware_project/hw.dat. They do not execute from the init file's directory.
+# Prepare each file manually from that machine's verified hw_runN.tcl; retain
+# allocation/load/clock/download/initialize order and finish with CPU reset=1.
+# No application writemem/readmem, write_image.tcl, CPU release or exit.
+[resident.init_scripts]
+"4" = "./init/init4.tcl"
+"5" = "./init/init5.tcl"
+"6" = "./init/init6.tcl"
+"7" = "./init/init7.tcl"
+
 [[nodes]]
 id = "local"
-ports = [4, 5]
+# After stopping with the old config and confirming availability, switching to
+# FPGA7 changes only this line to ports = [7]; then start and check READY.
+ports = [6]
 uvhs_shell = "/path/to/vendor/bin/uvhs2_shell"
 uart_prefix = "/dev/FPGA"

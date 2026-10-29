@@ -360,6 +360,28 @@ class InputTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     load(path)
 
+    def test_bosc_configuration_supports_ports_beyond_two_boards(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / 'config.toml'
+            for port in (43, 8, 0):
+                (Path(root) / f'init{port}.tcl').write_text('# config path fixture\n')
+            for backend in ('bosc', 'bosc-resident'):
+                base = ('backend="' + backend + '"\nstate_dir="state"\ntoken_file="token"\n'
+                        '[resident]\nhardware_project="project"\nlock_dir="locks"\n'
+                        '[resident.init_scripts]\n"43"="init43.tcl"\n"8"="init8.tcl"\n"0"="init0.tcl"\n'
+                        '[[nodes]]\nid="a"\nports=[43,8,0]\n'
+                        'root="/runtime"\nuvhs_shell="/vendor/uvhs2_shell"\n')
+                if backend == 'bosc':
+                    base += 'ssh_host="fpga"\n'
+                with self.subTest(backend=backend):
+                    path.write_text(base)
+                    self.assertEqual(load(path).nodes[0].ports, (43, 8, 0))
+                for ports in ('[-1]', '[43,43]', '[true]', '[8.0]', '[]'):
+                    with self.subTest(backend=backend, ports=ports):
+                        path.write_text(base.replace('[43,8,0]', ports))
+                        with self.assertRaisesRegex(ValueError, 'distinct nonnegative integers'):
+                            load(path)
+
 
 class FailureBoundaryTests(unittest.TestCase):
     setUp = QueueTests.setUp

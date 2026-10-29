@@ -24,21 +24,31 @@ BUSY_TOKEN = '[scheduler] RETRY_BEFORE_LOAD'
 
 
 def parse_fpgas(output):
+    """Return the devices UVHS actually reports, preserving physical IDs.
+
+    A host need not expose both boards (or all four DUTs on a board). Missing
+    devices are not free devices; callers must check their configured targets.
+    """
     ports = {}
     for line in output.splitlines():
         fields = line.split()
-        if len(fields) not in (7, 8) or fields[0] != 'uvhs-0':
+        if not fields or fields[0] != 'uvhs-0':
             continue
-        if not re.fullmatch(r'B[01]', fields[1]) or not re.fullmatch(r'F[0-3]', fields[2]):
+        if len(fields) < 2 or not fields[1].startswith('B'):
             continue
-        number = int(fields[1][1]) * 4 + int(fields[2][1])
+        if (len(fields) not in (7, 8) or not re.fullmatch(r'B\d+', fields[1])
+                or not re.fullmatch(r'F[0-3]', fields[2])
+                or fields[3] not in ('on', 'off') or fields[4] != 'link'
+                or fields[5] not in ('up', 'down') or fields[-1] not in ('true', 'false')):
+            raise RuntimeError('UVHS returned an invalid FPGA row: ' + line.strip())
+        number = int(fields[1][1:]) * 4 + int(fields[2][1])
         if number in ports:
             raise RuntimeError('UVHS returned a duplicate FPGA')
         owner = fields[6] if len(fields) == 8 else ''
-        ports[number] = dict(number=number, board=fields[1], fpga=fields[2],
+        ports[number] = dict(number=number, board=f'B{number // 4}', fpga=fields[2],
                              owner=owner, power=fields[3], booked=fields[-1] != 'false')
-    if set(ports) != set(range(8)):
-        raise RuntimeError('UVHS did not return all eight FPGA units')
+    if not ports:
+        raise RuntimeError('UVHS did not return any FPGA units')
     return ports
 
 
@@ -75,6 +85,7 @@ def inventory(held=None):
     if query.returncode or re.search(r'Total (?:ERROR|FATAL):\s*[1-9]', query.stdout):
         raise RuntimeError('UVHS status query failed')
     ports = parse_fpgas(query.stdout)
+    discovered = set(ports)
     # Board clocks/connectors are shared. Avoid a board used by another account.
     busy_boards = set()
     username = pwd.getpwuid(os.getuid()).pw_name
@@ -92,6 +103,11 @@ def inventory(held=None):
             busy_boards.add(port['board'])
     processes = subprocess.check_output(['ps', '-eo', 'pid=,args='], text=True)
     for number in ORDER:
+        if number not in ports:
+            board, fpga = divmod(number, 4)
+            ports[number] = dict(number=number, board=f'B{board}', fpga=f'F{fpga}',
+                                 available=False, reasons=['FPGA missing from UVHS inventory'])
+            continue
         port = ports[number]
         device = Path(f'{UART_PREFIX}{number}')
         reasons = []
@@ -99,6 +115,11 @@ def inventory(held=None):
         if port['owner']: reasons.append('FPGA occupied')
         if port['booked']: reasons.append('reserved')
         if port['board'] in busy_boards: reasons.append('board in use (shared clock)')
+        board_start = number // 4 * 4
+        if not set(range(board_start, board_start + 4)) <= discovered:
+            # This runner configures shared clocks on every run. Unseen
+            # siblings cannot be assumed idle even when the target is free.
+            reasons.append('board inventory incomplete')
         if not device.exists():
             reasons.append('UART missing')
         else:
@@ -293,7 +314,7 @@ def main():
     retire.add_argument('before', type=float)
     run = commands.add_parser('run')
     run.add_argument('id', type=lambda value: value if re.fullmatch(r'[0-9a-f]{32}', value) else parser.error('invalid id'))
-    run.add_argument('fpga', type=int, choices=range(8))
+    run.add_argument('fpga', type=int)
     run.add_argument('sha256', type=lambda value: value if re.fullmatch(r'[0-9a-f]{64}', value) else parser.error('invalid hash'))
     run.add_argument('timeout', type=int, choices=range(1, 601))
     run.add_argument('idle', type=int, choices=range(1, 121))
@@ -301,8 +322,8 @@ def main():
     ROOT = args.root.resolve()
     UVHS, UART_PREFIX = args.uvhs, args.uart_prefix
     ORDER = tuple(int(p) for p in args.ports.split(','))
-    if not ORDER or len(set(ORDER)) != len(ORDER) or any(p not in range(8) for p in ORDER):
-        parser.error('ports must be distinct values in 0..7')
+    if not ORDER or len(set(ORDER)) != len(ORDER) or any(p < 0 for p in ORDER):
+        parser.error('ports must be distinct nonnegative integers')
     if args.action == 'run' and args.fpga not in ORDER:
         parser.error('FPGA port is outside configured pool')
     if args.action == 'cleanup':

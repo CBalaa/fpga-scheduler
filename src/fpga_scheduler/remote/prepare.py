@@ -38,8 +38,8 @@ def main():
     parser.add_argument('--destination', type=Path, default=Path.home() / 'fpga-platform')
     args = parser.parse_args()
     ports = tuple(int(p) for p in args.ports.split(','))
-    if not ports or len(set(ports)) != len(ports) or any(p not in range(8) for p in ports):
-        raise ValueError('ports must be distinct numbers in 0..7')
+    if not ports or len(set(ports)) != len(ports) or any(p < 0 for p in ports):
+        raise ValueError('ports must be distinct nonnegative integers')
     scripts = {n: bind_port((args.project / 'user_script/hw_run' / f'hw_run{n}.tcl').read_text(), n,
                            explicit_allocation=args.explicit_allocation)
                for n in ports}

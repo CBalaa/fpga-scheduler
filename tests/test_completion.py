@@ -1,4 +1,5 @@
 """UART framing and real PTY sessions; no hardware is used by these tests."""
+import io
 import json
 import os
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 from fpga_scheduler.backends.bosc import BOSC
 from fpga_scheduler.config import Node
+from fpga_scheduler.remote import prepare
 from fpga_scheduler.remote.runner import Completion, ProtocolError, platform_error
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -59,14 +61,45 @@ class ProtocolTests(unittest.TestCase):
             self.assertTrue(platform_error(text))
 
 
+class RuntimePreparationTests(unittest.TestCase):
+    def test_preparation_binds_ports_beyond_two_boards_and_rejects_invalid_ports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / 'project'
+            scripts = project / 'user_script/hw_run'
+            scripts.mkdir(parents=True)
+            (project / 'Makefile').write_text('')
+            (project / 'hw.dat').mkdir()
+            scheduler = root / 'scheduler.py'
+            scheduler.write_text('')
+            for number in (8, 43):
+                (scripts / f'hw_run{number}.tcl').write_text('load_db -release\nload_db -db ./hw.dat\n')
+            destination = root / 'runtime'
+            arguments = ['prepare.py', '--project', str(project), '--scheduler', str(scheduler),
+                         '--destination', str(destination), '--explicit-allocation', '--ports=8,43']
+            with patch('sys.argv', arguments), patch('sys.stdout', io.StringIO()):
+                prepare.main()
+            for number, target in ((8, 'b2.f0'), (43, 'b10.f3')):
+                source = (destination / 'user_script/hw_run' / f'hw_run{number}.tcl').read_text()
+                self.assertEqual(source, 'load_db -release\nallocate -board {' + target
+                                 + '}\nload_db -db ./hw.dat -to {' + target + '}\n')
+            invalid_destination = root / 'invalid-runtime'
+            arguments[arguments.index('--destination') + 1] = str(invalid_destination)
+            for ports in ('-1', '8,8', 'true', ''):
+                with self.subTest(ports=ports), patch('sys.argv', arguments[:-1] + ['--ports=' + ports]):
+                    with self.assertRaises(ValueError):
+                        prepare.main()
+            self.assertFalse(invalid_destination.exists())
+
+
 class RunnerSessionTests(unittest.TestCase):
-    def session(self, uart, *, readback=True, tool_error=False, deadline=3):
+    def session(self, uart, *, readback=True, tool_error=False, deadline=3, fpga=4):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             hardware, slave = pty.openpty()
             uart_device = os.ttyname(slave)
             os.close(slave)
-            (root / 'uart4').symlink_to(uart_device)
+            (root / f'uart{fpga}').symlink_to(uart_device)
             image = root / 'input_padded.bin'
             image.write_bytes(b'hello input')
             output = root / 'output'
@@ -91,7 +124,7 @@ print('Total ERROR: '+os.environ['TEST_TOOL_ERROR'], flush=True)
                    'UV_RUN_OUT_ROOT': str(output), 'FPGA_UART_PREFIX': str(root / 'uart'),
                    'FPGA_EXECUTION_TIMEOUT': str(deadline), 'FPGA_STARTUP_TIMEOUT': '3',
                    'TEST_READBACK': str(int(readback)), 'TEST_TOOL_ERROR': str(int(tool_error))}
-            process = subprocess.Popen([sys.executable, str(RUNNER), '--fpga=4',
+            process = subprocess.Popen([sys.executable, str(RUNNER), f'--fpga={fpga}',
                                         '--workdir=' + str(root), 'test=' + str(image)],
                                        env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             errors = []
@@ -132,6 +165,21 @@ print('Total ERROR: '+os.environ['TEST_TOOL_ERROR'], flush=True)
             self.assertEqual(result['app_exit_code'], code)
             self.assertEqual(result['exit_code'], 0 if code == 0 else 1)
             self.assertTrue(result['details']['ddr_readback_matches'])
+
+    def test_port_beyond_two_boards_runs_with_its_uart(self):
+        result = self.session(START + terminal(), fpga=43)
+        self.assertEqual(result['execution_status'], 'exited')
+        self.assertEqual(result['app_exit_code'], 0)
+
+    def test_runner_rejects_negative_or_noninteger_ports_before_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for port in ('-1', 'true', '8.0'):
+                with self.subTest(port=port):
+                    process = subprocess.run([sys.executable, str(RUNNER), '--fpga=' + port,
+                                              '--workdir=' + tmp, 'test=' + tmp + '/input.bin'],
+                                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    self.assertEqual(list(Path(tmp).iterdir()), [])
 
     def test_missing_terminal_and_false_pass_time_out(self):
         result = self.session(START + b'PASS\r\n', deadline=.7)

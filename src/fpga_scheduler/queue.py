@@ -33,8 +33,21 @@ class JobQueue:
         self.lock = threading.RLock()
         self.dispatch_lock = threading.Lock()
         self.inventory_lock = threading.Lock()
+        # Resident probes can initialize a shell and take minutes. Keep HTTP
+        # status independent of both the hardware and queue/SQLite locks.
+        self.background_inventory = bool(getattr(backend, 'background_inventory', False))
+        self.inventory_cache_lock = threading.Lock()
+        self.inventory_monitor = None
+        self.inventory_refreshing = False
+        self.inventory_sampled_at = None
+        self.inventory_ports = [dict(node=n.id, number=p, available=False, state='RECOVERING',
+                                     reasons=['Hardware initialization pending'], session=None, downloads=0)
+                                for n in backend.nodes for p in n.ports]
+        self.inventory_errors, self.inventory_reserved, self.inventory_cooling = {}, set(), {}
+        self.inventory_versions = {}
         self.interval, self.capacity, self.cooldown, self.retention = interval, capacity, cooldown, retention
         self.wake, self.stopping = threading.Event(), threading.Event()
+        self.inventory_wake = threading.Event()
         self.reserved, self.workers = set(), set()
         self.controls = {}
         self.heartbeat_seconds, self.lease_seconds = client_heartbeat_seconds, client_lease_seconds
@@ -78,14 +91,26 @@ class JobQueue:
         self.dispatcher.start()
         self.lease_monitor = threading.Thread(target=self._lease_loop, name='fpga-client-leases', daemon=True)
         self.lease_monitor.start()
+        if self.background_inventory:
+            self.inventory_monitor = threading.Thread(target=self._inventory_loop, name='fpga-inventory', daemon=True)
+            self.inventory_monitor.start()
 
-    def close(self):
+    def request_stop(self):
+        """Stop admitting/initializing hardware while existing work drains."""
         self.stopping.set()
         self.wake.set()
+        self.inventory_wake.set()
+        if self.background_inventory and hasattr(self.backend, 'stop_initialization'):
+            self.backend.stop_initialization()
+
+    def close(self):
+        self.request_stop()
         if self.dispatcher:
             self.dispatcher.join()
         if self.lease_monitor:
             self.lease_monitor.join()
+        if self.inventory_monitor:
+            self.inventory_monitor.join()
         # Backends have bounded transport/execution timeouts. Keep DB and the
         # service's state-directory lock alive until every assignment retires.
         with self.dispatch_lock:
@@ -309,6 +334,40 @@ class JobQueue:
             if control.request(reason):
                 self.db.execute("UPDATE jobs SET state='cancelling',cancel_reason=? WHERE id=?", (reason, ident))
 
+    def inventory_snapshot(self):
+        """Read the resident cache without initiating or waiting for hardware work."""
+        if not self.background_inventory:
+            return self.inventory()
+        with self.inventory_cache_lock:
+            ports = []
+            now = time.time()
+            for port in self.inventory_ports:
+                reasons = list(port.get('reasons', []))
+                key = port['node'], port['number']
+                if key in self.inventory_reserved:
+                    reasons.append('platform task active')
+                if self.inventory_cooling.get(key, 0) > now:
+                    reasons.append('failure cooldown')
+                if self.stopping.is_set():
+                    reasons.append('Service is stopping')
+                ports.append(dict(port, available=port['available'] and not reasons, reasons=reasons))
+            return dict(devices=ports, errors=dict(self.inventory_errors),
+                        sampled_at=self.inventory_sampled_at, refreshing=self.inventory_refreshing)
+
+    def _inventory_loop(self):
+        # Start resident initialization even when there are no queued jobs.
+        # This is the only new background caller; HTTP only reads the cache.
+        while not self.stopping.is_set():
+            self.inventory_wake.clear()
+            try:
+                self.inventory()
+            except Exception:
+                LOG.exception('Background device inventory failed')
+            self.wake.set()
+            if self.stopping.is_set():
+                break
+            self.inventory_wake.wait(self.interval)
+
     def inventory(self):
         def probe(node):
             try:
@@ -326,23 +385,51 @@ class JobQueue:
             except Exception:
                 return node, [], 'Device probe unavailable or invalid'
         with self.inventory_lock:
-            with ThreadPoolExecutor(max_workers=len(self.nodes)) as pool:
-                results = list(pool.map(probe, self.nodes))
-            with self.lock:
-                self.ports = [p for _, ports, _ in results for p in ports]
-                self.node_errors = {node: error for node, _, error in results if error}
-                self.status_error = 'Some nodes are unavailable; waiting for healthy devices' if self.node_errors else None
-                cooling = {(r['node'], r['fpga']) for r in self.db.execute('SELECT node,fpga FROM cooldowns WHERE until>?', (time.time(),))}
-                ports = []
-                for port in self.ports:
-                    reasons = list(port.get('reasons', []))
-                    key = port['node'], port['number']
-                    if key in self.reserved:
-                        reasons.append('platform task active')
-                    if key in cooling:
-                        reasons.append('failure cooldown')
-                    ports.append(dict(port, available=port['available'] and not reasons, reasons=reasons))
-                return dict(devices=ports, errors=dict(self.node_errors))
+            if self.background_inventory:
+                # A caller queued behind an in-flight probe must not start a
+                # new initialization after shutdown has begun.
+                if self.stopping.is_set():
+                    return self.inventory_snapshot()
+                with self.inventory_cache_lock:
+                    self.inventory_refreshing = True
+                    versions = dict(self.inventory_versions)
+            try:
+                with ThreadPoolExecutor(max_workers=len(self.nodes)) as pool:
+                    results = list(pool.map(probe, self.nodes))
+                with self.lock:
+                    self.ports = [p for _, ports, _ in results for p in ports]
+                    self.node_errors = {node: error for node, _, error in results if error}
+                    self.status_error = 'Some nodes are unavailable; waiting for healthy devices' if self.node_errors else None
+                    cooling = {(r['node'], r['fpga']): r['until'] for r in self.db.execute(
+                        'SELECT node,fpga,until FROM cooldowns WHERE until>?', (time.time(),))}
+                    if self.background_inventory:
+                        with self.inventory_cache_lock:
+                            # A probe may have sampled READY before a running
+                            # task failed, then waited for the queue lock. Its
+                            # older result must not undo failure invalidation.
+                            self.ports = [dict(p, available=False, state='RECOVERING',
+                                               reasons=['Task failed during inventory; awaiting fresh hardware status'])
+                                          if versions.get((p['node'], p['number']), 0) != self.inventory_versions.get(
+                                              (p['node'], p['number']), 0) else p for p in self.ports]
+                            self.inventory_ports = [dict(p, reasons=list(p.get('reasons', []))) for p in self.ports]
+                            self.inventory_errors = dict(self.node_errors)
+                            self.inventory_reserved = self.reserved.copy()
+                            self.inventory_cooling = cooling
+                            self.inventory_sampled_at = time.time()
+                    ports = []
+                    for port in self.ports:
+                        reasons = list(port.get('reasons', []))
+                        key = port['node'], port['number']
+                        if key in self.reserved:
+                            reasons.append('platform task active')
+                        if key in cooling:
+                            reasons.append('failure cooldown')
+                        ports.append(dict(port, available=port['available'] and not reasons, reasons=reasons))
+                    return dict(devices=ports, errors=dict(self.node_errors))
+            finally:
+                if self.background_inventory:
+                    with self.inventory_cache_lock:
+                        self.inventory_refreshing = False
 
     def dispatch_once(self):
         with self.dispatch_lock:
@@ -408,6 +495,9 @@ class JobQueue:
                     continue
                 self.next_node = (self.nodes.index(node) + 1) % len(self.nodes)
                 self.reserved.add((node, port))
+                if self.background_inventory:
+                    with self.inventory_cache_lock:
+                        self.inventory_reserved = self.reserved.copy()
                 control = Cancellation()
                 self.controls[job['id']] = control
                 worker = threading.Thread(target=self.execute, args=(job, node, port, control), name='fpga-' + job['id'])
@@ -418,6 +508,9 @@ class JobQueue:
                 except Exception:
                     # No backend call took place; retain this ticket for a later pass.
                     self.reserved.discard((node, port))
+                    if self.background_inventory:
+                        with self.inventory_cache_lock:
+                            self.inventory_reserved = self.reserved.copy()
                     self.workers.discard(worker)
                     self.controls.pop(job['id'], None)
                     if hasattr(self.backend, 'release_prepared'):
@@ -526,10 +619,25 @@ class JobQueue:
                 clean_abort = (result and result.get('execution_status') in ('timeout', 'cancelled')
                                and result.get('details', {}).get('reset_confirmed') is True)
                 if state == 'failed' and launched and not clean_abort:
-                    self.db.execute('INSERT OR REPLACE INTO cooldowns VALUES (?,?,?)', (node, port, time.time() + self.cooldown))
+                    until = time.time() + self.cooldown
+                    self.db.execute('INSERT OR REPLACE INTO cooldowns VALUES (?,?,?)', (node, port, until))
+                    if self.background_inventory:
+                        with self.inventory_cache_lock:
+                            self.inventory_cooling[node, port] = until
+                            key = node, port
+                            self.inventory_versions[key] = self.inventory_versions.get(key, 0) + 1
+                            self.inventory_ports = [dict(p, available=False, state='RECOVERING',
+                                                         reasons=['Task failed; awaiting fresh hardware status'])
+                                                    if (p['node'], p['number']) == key and p['available'] else p
+                                                    for p in self.inventory_ports]
+                if self.background_inventory:
+                    with self.inventory_cache_lock:
+                        self.inventory_reserved = self.reserved.copy()
                 self.workers.discard(threading.current_thread())
                 self.controls.pop(job['id'], None)
             self.wake.set()
+            if self.background_inventory:
+                self.inventory_wake.set()
 
     def loop(self):
         while not self.stopping.is_set():

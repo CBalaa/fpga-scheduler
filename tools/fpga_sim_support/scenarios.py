@@ -84,6 +84,24 @@ def read_image(path):
     return validate_scenario(json.loads(content[len(MAGIC):]))
 
 
+def prepare_initialization_scripts(directory, ports):
+    """Prepare software-only explicit initializers; preserve existing deployment files."""
+    root = Path(directory).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    scripts = {}
+    for number in ports:
+        path = root / f'init{number}.tcl'
+        if not path.exists():
+            board, fpga = divmod(number, 4)
+            path.write_text('# Source: repository software-only FPGA simulator, version 1\n'
+                            'load_db -release\n'
+                            f'load_db -db ./hw.dat -to {{b{board}.f{fpga}}}\n'
+                            'reset -name cpu_reset -value 1\nquery -reset\n'
+                            'download\ninitialize\nquery -reset\n')
+        scripts[number] = str(path)
+    return scripts
+
+
 def create_environment(directory, *, port=18766, ports=(4, 5)):
     """Create a new deployment; never overwrite an existing config or token."""
     if not shutil.which('tclsh'):
@@ -98,12 +116,15 @@ def create_environment(directory, *, port=18766, ports=(4, 5)):
     fd = os.open(token, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as handle:
         handle.write(secrets.token_urlsafe(32) + '\n')
+    prepare_initialization_scripts(root / 'init', ports)
+    scripts = '\n'.join(f'"{number}" = "./init/init{number}.tcl"' for number in ports)
     config = root / 'config.local.toml'
     config.write_text('backend = "bosc-resident"\nstate_dir = "./state"\ntoken_file = "./service.token"\n'
                       f'bind = "127.0.0.1"\nport = {port}\npoll_interval = 0.05\ncooldown_seconds = 0\n'
                       '\n[resident]\nstartup_timeout = 5\ncommand_timeout = 2\nuart_quiet_seconds = 0.03\n'
                       'recovery_backoff = 0.1\nhardware_project = "./state/sim/project"\n'
-                      'lock_dir = "./state/sim/locks"\n\n[[nodes]]\nid = "sim-local"\nports = '
+                      'lock_dir = "./state/sim/locks"\n\n[resident.init_scripts]\n' + scripts
+                      + '\n\n[[nodes]]\nid = "sim-local"\nports = '
                       + str(list(ports)) + '\nuvhs_shell = '
                       + json.dumps(str(root / 'state/sim/uvhs-sim')) + '\nuart_prefix = '
                       + json.dumps(str(root / 'state/sim/uart')) + '\n')

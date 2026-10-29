@@ -15,7 +15,7 @@ import time
 
 from fpga_scheduler.backends.resident import Resident
 from fpga_scheduler.remote.uvhs_session import atomic_json, tcl
-from .scenarios import STATE_IDENTITY, check_state_directory, read_image
+from .scenarios import STATE_IDENTITY, check_state_directory, prepare_initialization_scripts, read_image
 
 
 class ResidentSimulator(Resident):
@@ -41,14 +41,11 @@ class ResidentSimulator(Resident):
         self.emitter_stop = threading.Event()
         self.emitter = None
         project = self.virtual_root / 'project'
-        (project / 'user_script/hw_run').mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
         (project / 'hw.dat').mkdir(exist_ok=True)
         prefix = self.virtual_root / 'uart'
-        for port in nodes[0].ports:
-            (project / f'user_script/hw_run/hw_run{port}.tcl').write_text(
-                'load_db -release\nload_db -db ./hw.dat\nconfig -clock -frequency 5529600 sys_clk\n'
-                'config -clock -commit\nreset -name cpu_reset -value 1\ndownload\ninitialize\n'
-                'source ./user_script/hw_run/write_image.tcl\n')
+        if 'init_scripts' not in options:
+            options['init_scripts'] = prepare_initialization_scripts(self.virtual_root / 'init', nodes[0].ports)
         wrapper = self.virtual_root / 'uvhs-sim'
         fixture = Path(__file__).with_name('uvhs.tcl')
         wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(executable) + ' ' + shlex.quote(str(fixture)) + ' "$@"\n')

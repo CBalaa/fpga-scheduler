@@ -9,13 +9,73 @@
 
 先排空并正常停止旧入口；所有能操作同一端口的部署使用相同 lock_dir。
 仍检查目标端口的 UVHS owner/booked、UART 占用与 TIOCEXCL，被占用时等待，不抢占。
-白名单修改必须用旧配置正常停止后进行。初始化与恢复不因同板其他 FPGA 有会话而直接阻塞：
-先只读查询物理时钟，`shared_clock_index`（默认 6，须与硬件工程 sys_clk 的映射一致）
-为 5.5296 MHz 时复用现有时钟，跳过 `config -clock` 和 commit，仅初始化白名单内空闲端口。
-时钟不一致或无法确认且同板仍有其他会话时保持 RECOVERING，不重配共享时钟；
-同板无其他会话时才允许设置时钟。板级锁仍串行化初始化，不要求运行任务排空。
+白名单修改必须用旧配置正常停止后进行。初始化前只读检查目标和同板占用、物理时钟，
+`shared_clock_index`（默认 6）须与硬件工程 sys_clk 的映射一致。同板其他 FPGA 有 owner、
+booked 或受管会话时，只有只读确认该板此 index 的实际频率为 NH 的 5529600 Hz，
+才允许原样执行初始化 Tcl；频率未知或不匹配则拒绝初始化。含时钟配置/commit 的脚本
+还要求同板单元信息完整；完整且同板没有其他活动端口时允许脚本配置时钟。
+不含时钟配置的脚本始终要求现有频率已匹配。scheduler 不省略或改写原 Tcl 的
+`config -clock` 与 commit；上述频率兼容性检查不保证同频 commit 在硬件上没有瞬态影响。
+板级锁串行化初始化，脚本与 NH profile/目标/共享时钟不兼容时说明原因。
 每次新建 UVHS 会话都刷新独立工作目录的 `hw.dat` 链接，使用配置工程当前指向的版本。
 切换工程版本后需正常停止并重新启动 daemon；已有会话不会在任务之间自动切换 bitstream。
+
+### 准备部署初始化文件
+
+这一步由人或部署 AI 在启动服务前完成，scheduler 运行时不自动从硬件脚本提取初始化部分。
+
+1. 在目标机器找到对应 FPGA 已验证可运行的 `~/Desktop/fpga-tester/user_script/hw_run/hw_runN.tcl`，重新只读核对内容及来源版本/SHA-256。
+2. 为计划使用的各端口提前在 scheduler 部署目录准备新的 `init/initN.tcl`。对当前参考脚本，人工复制 `source ./user_script/hw_run/write_image.tcl` 之前的内容。不要修改原 `hw_runN.tcl`、原硬件工程或供应商目录。
+3. 保留资源分配、数据库加载、连接器、时钟配置、download、initialize 的原参数和顺序。`fpga` 的参考顺序是 `load_db -release` 后 `load_db -db ./hw.dat -to {b1.f0}`；`fpga113` 的参考顺序是 `allocate -board {b1.f0}`、`load_db -release`、`load_db -db ./hw.dat`。两者是机器已验证的参考流程，不是通用模板，部署时必须重新确认。
+4. 结束时保持 `cpu_reset=1` 并查询确认。不能包含应用 bin 的 writemem/readmem、`source write_image.tcl`、释放 CPU 复位或 `exit`/关闭 shell。
+5. 初始化文件头用注释记录来源服务器、原文件路径、版本或 SHA-256；硬件项目升级后重新核对。每个端口分别准备，不将 FPGA4 的目标直接套给 FPGA5。
+6. 在配置中使用 `[resident.init_scripts]`，登记所有已准备的脚本；每个 `[[nodes]].ports` 启用端口必须有映射，允许额外登记未启用端口。配置加载检查所有登记项的规范编号、路径和文件可读性，因此未启用端口的文件也必须存在。仅启用端口接受 Tcl 内容、目标编号和 NH profile 的兼容性校验，并在每次会话重建时重新校验；共享时钟及占用检查在实际初始化前执行。不兼容或初始化失败会明确报错，没有旧初始化回退。原有的单端口映射仍兼容。
+
+例如提前登记 FPGA4–7、只启用 FPGA6：
+
+```toml
+[resident.init_scripts]
+"4" = "./init/init4.tcl"
+"5" = "./init/init5.tcl"
+"6" = "./init/init6.tcl"
+"7" = "./init/init7.tcl"
+
+[[nodes]]
+id = "local"
+ports = [6]
+uvhs_shell = "/path/to/vendor/bin/uvhs2_shell"
+```
+
+`ports` 是唯一启用白名单。登记 FPGA4、5、7 的路径不会创建这些端口的会话、打开 UART、
+分配硬件、下载 bitstream 或执行 Tcl。切换时保留节点的其他配置，用旧配置正常停止后，
+只更改 `ports`；不自动选择目标或改写 Tcl：
+
+```bash
+ssh fpga113
+cd ~/fpga-resident-deploy
+source ./env.sh
+fpga-scheduler daemon stop
+/bitstream/nanhu-ra/scripts/check_fpga.sh
+vim config.local.toml  # 确认目标空闲，仅将 ports = [6] 改为 ports = [7]
+fpga-scheduler daemon start
+fpga-scheduler daemon status
+```
+
+无需改动 `init_scripts` 或 Tcl 文件；最终必须看到 FPGA7 为 `READY`。占用、锁、共享时钟、
+命令确认、超时和 CPU 复位检查仍然生效；不能删除时钟命令来绕过共享时钟保护。
+
+初始化文件路径相对 **TOML 配置文件目录**解析（绝对路径也可），支持开头的 `~`，
+不展开 `$HOME` 等环境变量。脚本执行 cwd 是常驻会话的隔离工作目录；`./hw.dat` 指向
+`hardware_project/hw.dat`，并非初始化文件所在目录。其他脚本依赖资源须使用明确可读路径；
+不要依赖原工程的 `./user_script` 运行文件。配置升级时删除 `resident.explicit_allocation`，
+包括原值为 `false` 的配置；分配策略和命令顺序完全由初始化文件提供。旧 bootstrap 缓存不再使用，
+`remote.prepare`/旧 BOSC 后端仍保留自己的旧流程，不受此 Resident 配置迁移影响。
+
+当前 NH 初始化校验器只接受可静态核对的简单 Tcl：逐条的已知初始化命令、注释、
+字面量变量赋值，以及参考脚本已有的 `UV_RUN_SYS_CLK_HZ` 环境覆盖块。环境覆盖的
+实际值也必须符合 NH 的 5529600 Hz。动态目标、任意嵌套 source、过程/循环或其他无法
+证明符合目标与共享时钟要求的结构会说明原因并拒绝执行，须由部署者人工核对；
+校验器不通过重写脚本来支持这些结构，也不把 Tcl 静态检查视为通用沙箱。
 
 远端系统 Python 3.8 不满足要求。管理员选用与目标 glibc 兼容的 Python 3.11+ 独立发行包，
 从可信发布者 HTTPS 清单独立取得 SHA256，再安装到新目录；不修改系统 Python 或厂商安装。
@@ -33,7 +93,11 @@ python3.11 tools/deploy_resident.py \
   --project /path/to/existing-hardware-project \
   --uvhs /path/to/vendor/bin/uvhs2_shell \
   --lock-dir /path/to/shared/scheduler-locks \
-  --destination ./resident-deploy --ports 4,5 --port 8765
+  --init-script 4=/path/to/prepared/init4.tcl \
+  --init-script 5=/path/to/prepared/init5.tcl \
+  --init-script 6=/path/to/prepared/init6.tcl \
+  --init-script 7=/path/to/prepared/init7.tcl \
+  --destination ./resident-deploy --ports 6 --port 8765
 ./resident-deploy/venv/bin/fpga-scheduler daemon start --config ./resident-deploy/config.local.toml
 ./resident-deploy/venv/bin/fpga-scheduler daemon status --config ./resident-deploy/config.local.toml
 ./resident-deploy/venv/bin/fpga-scheduler daemon stop --config ./resident-deploy/config.local.toml
@@ -52,11 +116,20 @@ serve 同样读取此变量。显式 --config 优先；变量未设置或为空�
 建议使用绝对路径，以免切换工作目录后指向不同配置；若需新终端自动生效，
 将 export 写入用户自己的 shell 启动文件。
 
-部署目录必须不存在。工具不修改原 Makefile、Tcl、hw.dat 或 systemd 设置。
-同样支持在 fpga113 本机部署，先确认该机路径、白名单和 UART；本次不在该机板测。
+部署目录必须不存在。工具要求为每个启用端口显式传入 `--init-script PORT=PATH`，
+也允许传入其他未启用端口的脚本。工具检查所有输入脚本可读且非空，按端口号排序原样复制到
+新部署的 `init/initN.tcl` 并登记，配置使用相对路径；`installation.json` 记录全部输入脚本路径及
+SHA-256，`ports` 单独记录启用白名单。工具不执行硬件命令，也不自动裁剪、生成或改写 Tcl。
+只管理 FPGA4 时仍可使用 `--ports 4` 和一个 `--init-script 4=...`。
+工具不修改原 Makefile、Tcl、hw.dat 或 systemd 设置。同样支持在 fpga113 本机部署，
+先确认该机路径、白名单和 UART。已有部署升级须保留原 token/state、正常停止服务，
+更换 wheel 和明确迁移配置，再启动；不要用此首次安装工具覆盖已有部署。
 从加载厂商环境的登录 shell 启动，supervisor 继承环境，SSH 断开后继续运行。
-start 等待 API 就绪；UVHS 首次初始化在 devices 或首个任务时进行，约一分钟/端口。
-首次 Client.devices 可提高 request_timeout=360。status 初始化期间可能显示查询超时。
+start 等待 API 就绪；Resident 的后台维护线程随后初始化白名单端口，即使没有排队任务也会进行。
+`devices` / `daemon status` 只读最近一次设备快照，不触发 UVHS 命令，也不等待初始化或硬件锁。
+首次采样完成前显示 `RECOVERING` / `Hardware initialization pending`；响应中的 `refreshing`
+表示后台查询正在进行，`sampled_at` 标明最近完成采样的时间。初始化完成后显示 `READY` 或
+具体拒绝/失败原因。设备快照可能暂时滞后，任务调度仍使用新查询结果和端口预留检查。
 stop 停止接收和调度，等待运行任务及卸载，保留 queued 并抑制重启。
 supervisor 回收自己登记的 UVHS 进程组，退避重启异常退出的 daemon；不保证主机重启、
 supervisor 被杀或系统清理用户进程后自动启动。可选 [systemd 模板](../deploy/fpga-scheduler.service.in)
@@ -104,9 +177,14 @@ CLI 使用 fpga-scheduler run hello.bin --timeout 120 保持前台，Ctrl+C 取�
 
 ## 执行与恢复
 
-初始化严格校验原 Tcl 的唯一 load/download/initialize 和写镜像边界，复制前缀到独立工作目录，
-绑定实际物理端口并保持 cpu_reset=1。UVHS 命令通过随机 session + 递增序号的 Tcl catch 回应确认，
+启动每个常驻 UVHS shell 后，原样 source 为该 FPGA 配置的部署初始化 Tcl，校验其与 NH profile、
+目标及共享时钟要求相容；不使用 bind_port、不按 write_image 边界自动切片，也不按主机名或开关
+组合 allocate/load_db。初始化成功后仍须独立确认 cpu_reset=1，不能只因 source 返回而设为 READY。
+UVHS 命令通过随机 session + 递增序号的 Tcl catch 回应确认，
 同时检查 ERROR/FATAL；hspRun> 不是成功依据。复位后必须 query -reset 确认 cpu_reset=1。
+初始化失败、超时或复位未确认均不可调度。日志保留 script 的来源/摘要及命令输出，供追踪失败。
+同一 shell 反复执行任务，正常任务不重复初始化或下载；正常 stop 清理资源并退出该 shell，
+故障恢复若需重建会话，重新执行配置的初始化文件。
 
 每任务保留 1 MiB 补齐、DDR 64 字节元素写入/读回逐字节比较、入口 0x80000000、
 rv64gc/lp64d、5.5296 MHz / 115200 UART。释放 CPU 前 fsync start intent，

@@ -14,7 +14,7 @@ import time
 import uuid
 
 from ..models import BUSY_EXIT, BUSY_TOKEN
-from ..remote.prepare import bind_port
+from ..remote.init_script import load_init_script
 from ..remote.runner import platform_error
 from ..remote.runtime import parse_fpgas
 from ..remote.uvhs_session import Session, atomic_json, fingerprint, retire_record
@@ -28,9 +28,10 @@ LOG = logging.getLogger(__name__)
 
 class Resident:
     supports_cancellation = True
+    background_inventory = True
     def __init__(self, nodes, state_dir, *, hardware_project, lock_dir,
                  recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824,
-                 shared_clock_index=6, explicit_allocation=False, keep_load_files=False,
+                 shared_clock_index=6, init_scripts=None, keep_load_files=False,
                  storage_retry_seconds=10, **options):
         if len(nodes) != 1:
             raise ValueError('Resident backend manages exactly one local node')
@@ -43,9 +44,23 @@ class Resident:
         if type(shared_clock_index) is not int or not 0 <= shared_clock_index <= 23:
             raise ValueError('shared_clock_index must be an integer in 0..23')
         self.shared_clock_index = shared_clock_index
-        if type(explicit_allocation) is not bool:
-            raise ValueError('explicit_allocation must be a boolean')
-        self.explicit_allocation = explicit_allocation
+        if 'explicit_allocation' in options:
+            raise ValueError('resident.explicit_allocation is no longer supported; prepare per-FPGA '
+                             'initialization Tcl and configure resident.init_scripts')
+        if (not isinstance(init_scripts, dict)
+                or any(type(p) is not int or p < 0 for p in init_scripts)):
+            raise ValueError('resident.init_scripts must map nonnegative FPGA port numbers to initialization Tcl paths')
+        missing = sorted(set(self.node.ports) - set(init_scripts))
+        if missing:
+            raise ValueError('resident.init_scripts must cover every enabled FPGA port '
+                             f'(missing={missing})')
+        self.init_scripts = {p: Path(value) for p, value in init_scripts.items()}
+        # Config loading resolves/checks every registered path. Only enabled
+        # ports require Tcl/profile/target validation here, before retiring old
+        # sessions; disabled registrations never initialize hardware. Rebuilds
+        # re-read and validate the selected port's file.
+        for p in self.node.ports:
+            load_init_script(self.init_scripts[p], p)
         self.recovery_attempts, self.backoff = recovery_attempts, recovery_backoff
         self.max_storage = max_storage_bytes
         self.keep_load_files = keep_load_files
@@ -56,7 +71,7 @@ class Resident:
         self.inputs = {}
         self.storage_reserved = {}
         self.stopped = False
-        self.bootstraps = {p: self._bootstrap(p) for p in self.node.ports}
+        self.initialization_stopping = threading.Event()
         # No dispatcher exists yet. Retire recorded old executors first, including
         # inherited port locks. Dirty hardware must still pass full initialization.
         for path in (self.root / 'probes').glob('*.json'):
@@ -73,33 +88,6 @@ class Resident:
         # removal of old load copies. This also reclaims pre-upgrade scratch.
         self._prune_load_files()
         self._storage_usage()
-
-    def _bootstrap(self, number):
-        source = bind_port((self.project / 'user_script/hw_run' / f'hw_run{number}.tcl').read_text(), number,
-                           explicit_allocation=self.explicit_allocation)
-        active = '\n'.join(line for line in source.splitlines() if not line.lstrip().startswith('#'))
-        anchor = 'source ./user_script/hw_run/write_image.tcl'
-        if active.count(anchor) != 1:
-            raise ValueError('Unsupported hardware script: expected one write_image boundary')
-        prefix = active.split(anchor)[0]
-        if (len(re.findall(r'^download\s*$', prefix, re.M)) != 1 or
-                len(re.findall(r'^initialize\s*$', prefix, re.M)) != 1 or
-                re.search(r'^\s*(source|exec|writemem|readmem)\b', prefix, re.M) or
-                'reset -name cpu_reset -value 1' not in prefix or
-                'reset -name cpu_reset -value 0' in prefix or '5529600' not in prefix):
-            raise ValueError('Unsupported resident NH hardware bootstrap')
-        clock_lines = [line.strip() for line in prefix.splitlines()
-                       if re.match(r'^\s*config\s+-clock\b', line)]
-        frequency = r'config -clock -frequency (?:5529600|\$sys_clk_hz) sys_clk'
-        if (len(clock_lines) != 2 or not re.fullmatch(frequency, clock_lines[0])
-                or clock_lines[1] != 'config -clock -commit'):
-            raise ValueError('Unsupported resident NH clock configuration')
-        # The NH-only profile fixes UART timing. Do not inherit a login shell's
-        # UV_RUN_SYS_CLK_HZ override when initializing alongside other users.
-        prefix = re.sub(r'(?m)^\s*' + frequency + r'\s*$',
-                        f'config -clock -frequency {NH_CLOCK_HZ} sys_clk', prefix)
-        # Administrator-controlled project, copied into an isolated workdir.
-        return prefix + '\nreset -name cpu_reset -value 1\nquery -reset\n'
 
     def _lock(self, name):
         handle = (self.locks / name).open('a')
@@ -137,7 +125,7 @@ class Resident:
         output = self._hardware_query('set_option runtime.database.remapping_enable true\nquery -clock')
         clocks = {}
         for line in output.splitlines():
-            match = re.fullmatch(r'\s*B([01])\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\S+\s+PLL\s*', line)
+            match = re.fullmatch(r'\s*B(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\S+\s+PLL\s*', line)
             if match:
                 key = int(match[1]), int(match[2])
                 if key in clocks:
@@ -146,23 +134,45 @@ class Resident:
         return clocks
 
     def _initialization_script(self, number, physical):
+        # Re-read for each rebuild; live sessions retain their original snapshot.
+        script = load_init_script(self.init_scripts[number], number)
         board = number // 4
         active = sorted(p for p, info in physical.items() if p != number and p // 4 == board
                         and (info['owner'] or info['booked'] or p in self.sessions))
         frequency = self._clocks().get((board, self.shared_clock_index))
-        if frequency is not None and abs(frequency - NH_CLOCK_HZ) <= .5:
-            # Even committing the same frequency can touch sibling outputs of
-            # the PLL. Reuse the existing clock without any config -clock call.
-            script = re.sub(r'(?m)^\s*config -clock[^\n]*$', '', self.bootstraps[number])
-            return f'puts {{Scheduler: reuse B{board}.GCLK{self.shared_clock_index} at {NH_CLOCK_HZ} Hz}}\n' + script
-        if active:
+        if script.configures_clock:
+            # Require full occupancy information before running clock commands.
+            # An active sibling forbids changing the shared frequency, rather
+            # than forbidding the deployment's verified initializer altogether.
+            # Execute its original commands, including a same-frequency commit;
+            # this is a frequency compatibility check, not a no-op guarantee.
+            missing = sorted(set(range(board * 4, board * 4 + 4)) - physical.keys())
+            if missing:
+                self.states[number].update(
+                    reason=f'Initialization Tcl configures shared B{board}.GCLK{self.shared_clock_index}; '
+                           + 'FPGA inventory missing ' + ', '.join(f'FPGA{p}' for p in missing),
+                    next_retry=time.monotonic() + self.backoff)
+                return None
+        if (active or not script.configures_clock) and (
+                frequency is None or abs(frequency - NH_CLOCK_HZ) > .5):
             actual = 'unknown' if frequency is None else f'{frequency:g} Hz'
+            constraint = (', '.join(f'FPGA{p}' for p in active) + ' active; '
+                          'refusing to change a shared clock' if active else
+                          'initialization Tcl has no clock configuration')
             self.states[number].update(
                 reason=f'Shared B{board}.GCLK{self.shared_clock_index} is {actual}; expected {NH_CLOCK_HZ} Hz; '
-                       + 'cannot change clock while ' + ', '.join(f'FPGA{p}' for p in active) + ' active',
+                       + constraint,
                 next_retry=time.monotonic() + self.backoff)
             return None
-        return self.bootstraps[number]
+        return script
+
+    @staticmethod
+    def _target(physical, number):
+        if number not in physical:
+            board, fpga = divmod(number, 4)
+            raise RuntimeError(f'FPGA{number} (B{board}.F{fpga}) missing from UVHS inventory; '
+                               + 'reported FPGA units: ' + ', '.join(map(str, sorted(physical))))
+        return physical[number]
 
     def _uart_busy(self, number):
         device = Path(self.node.uart_prefix + str(number))
@@ -189,6 +199,9 @@ class Resident:
 
     def _initialize(self, number):
         state = self.states[number]
+        if self.initialization_stopping.is_set():
+            state['reason'] = 'Service is stopping'
+            return
         board = number // 4
         board_lock = self._lock(f'board{board}.lock')
         if board_lock is None:
@@ -200,7 +213,7 @@ class Resident:
             # A sibling FPGA is an independent execution slot. Only ownership
             # of this target prevents allocation; shared clocks are checked
             # separately before any initialization commands are submitted.
-            info = physical[number]
+            info = self._target(physical, number)
             if (info['owner'] or info['booked']) and number not in self.sessions:
                 state['reason'] = f'FPGA{number} occupied by another session'
                 return
@@ -208,10 +221,10 @@ class Resident:
                 self.sessions.pop(number).close()
                 # Confirm unload retired ownership before any full rebuild.
                 physical = self._physical()
-                if physical[number]['owner'] or physical[number]['booked']:
+                info = self._target(physical, number)
+                if info['owner'] or info['booked']:
                     state['reason'] = 'Previous session ownership has not retired'
                     return
-            info = physical[number]
             if info['power'] != 'on':
                 state['reason'] = 'FPGA power off'
                 return
@@ -221,6 +234,11 @@ class Resident:
                 return
             bootstrap = self._initialization_script(number, physical)
             if bootstrap is None:
+                return
+            # Inventory/clock queries can take minutes. A graceful stop may
+            # have arrived while they ran; do not allocate a new session now.
+            if self.initialization_stopping.is_set():
+                state['reason'] = 'Service is stopping'
                 return
             handle = self._lock(f'fpga{number}.lock')
             if handle is None:
@@ -268,7 +286,8 @@ class Resident:
         with self.guard:
             if not self.stopped:
                 for number, state in self.states.items():
-                    if state['state'] == 'RECOVERING' and time.monotonic() >= state['next_retry']:
+                    if (not self.initialization_stopping.is_set()
+                            and state['state'] == 'RECOVERING' and time.monotonic() >= state['next_retry']):
                         self._initialize(number)
                     session = self.sessions.get(number)
                     if session and state['state'] == 'READY' and session.process.poll() is not None:
@@ -478,7 +497,13 @@ class Resident:
         with self.guard:
             self._storage_usage()
 
+    def stop_initialization(self):
+        # Never wait for guard: an in-flight initialization may own it. Running
+        # tasks retain their sessions until the queue finishes draining.
+        self.initialization_stopping.set()
+
     def close(self):
+        self.stop_initialization()
         with self.guard:
             self.stopped = True
             for session in self.sessions.values():

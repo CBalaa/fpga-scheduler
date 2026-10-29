@@ -52,8 +52,8 @@ def status(path):
             value['api_error'] = str(error)
             return value
         # Persist each successful component before querying the next one.
-        # /devices may initialize/recover hardware and exceed our short HTTP
-        # timeout; that does not mean the already-healthy API is unavailable.
+        # Resident /devices reads a background snapshot; other backends may
+        # still exceed the short HTTP timeout. Keep successful health results.
         for name, query in (('queue', lambda: client.jobs(limit=1)), ('ports', client.devices)):
             try:
                 value[name] = query()

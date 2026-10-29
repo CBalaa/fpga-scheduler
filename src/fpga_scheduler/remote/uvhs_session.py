@@ -139,7 +139,17 @@ class Session:
         self.downloads = 0
         self.record = self.directory / 'session.json'
 
-    def start(self, bootstrap):
+    def start(self, initialization):
+        # Execute the validated deployment file verbatim from an immutable-for-
+        # this-session snapshot. Relative Tcl paths use the isolated workdir.
+        snapshot = self.directory / 'init.tcl'
+        temporary = snapshot.with_suffix('.tmp')
+        temporary.write_bytes(initialization.content)
+        temporary.replace(snapshot)
+        origin = dict(source=str(initialization.path), sha256=initialization.sha256,
+                      snapshot=str(snapshot), session=self.epoch)
+        atomic_json(self.directory / 'init-script.json', origin)
+        self.control.write(('Scheduler initialization: ' + json.dumps(origin) + '\n').encode())
         self.serial = os.open(self.node.uart_prefix + str(self.number), os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         fcntl.ioctl(self.serial, termios.TIOCEXCL)
         self.saved_attrs = termios.tcgetattr(self.serial)
@@ -166,8 +176,11 @@ class Session:
             os.close(slave)
         atomic_json(self.record, dict(epoch=self.epoch, pid=self.process.pid,
                                      start_ticks=fingerprint(self.process.pid), number=self.number, dirty=True))
-        self.command(bootstrap, timeout=self.startup_timeout)
+        self.command('source ' + tcl(snapshot), timeout=self.startup_timeout)
         self.downloads = 1
+        # Do not repair a script that leaves CPU reset deasserted and then call
+        # it ready. The script itself must satisfy its reset contract first.
+        self.confirm_reset(self.command('query -reset'))
         self.reset()
         self.boundary()
 
@@ -192,13 +205,18 @@ class Session:
             raise RuntimeError('Previous UVHS command is unacknowledged; refusing another hardware command')
         self.seq += 1
         marker = f'@@CONTROL_{self.epoch}_{self.seq} '
-        command = ('set __scheduler_rc [catch ' + tcl(script) + ' __scheduler_value]; '
+        diagnostics = ('if {$__scheduler_rc != 0} {puts stderr "Scheduler Tcl error: $__scheduler_value"; '
+                       'if {[dict exists $__scheduler_options -errorinfo]} '
+                       '{puts stderr [dict get $__scheduler_options -errorinfo]}; flush stderr}; ')
+        command = ('set __scheduler_rc [catch ' + tcl(script) + ' __scheduler_value __scheduler_options]; '
+                   + diagnostics +
                    'puts "' + marker + '$__scheduler_rc"; flush stdout\n').encode()
         # Long writes can exceed the canonical PTY input buffer; scripts use source.
         if len(command) > 3500:
             path = self.directory / 'command.tcl'
             path.write_text(script + '\n')
-            command = ('set __scheduler_rc [catch {source ' + tcl(path) + '} __scheduler_value]; '
+            command = ('set __scheduler_rc [catch {source ' + tcl(path) + '} __scheduler_value __scheduler_options]; '
+                       + diagnostics +
                        'puts "' + marker + '$__scheduler_rc"; flush stdout\n').encode()
         if cancellation is None:
             self.command_pending = True
@@ -228,6 +246,10 @@ class Session:
 
     def reset(self):
         output = self.command('reset -name cpu_reset -value 1\nquery -reset')
+        return self.confirm_reset(output)
+
+    @staticmethod
+    def confirm_reset(output):
         # Require the queried value; a command acknowledgement alone is not proof.
         if re.search(rb'(?m)^[ \t]*(?:[0-9]+[ \t]+[01][ \t]+)?cpu_reset[ \t]+1[ \t]*\r*$', output, re.I) is None:
             raise RuntimeError('CPU reset assertion was not confirmed by query -reset')

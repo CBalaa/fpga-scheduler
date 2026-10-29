@@ -83,8 +83,6 @@ def load(path):
             if name in raw and (not isinstance(raw[name], str) or '\x00' in raw[name] or '\n' in raw[name]):
                 raise ValueError(f'Invalid node {name}')
         if backend == 'bosc':
-            if any(p > 7 for p in ports):
-                raise ValueError('BOSC UVHS ports must be within 0..7')
             host = raw.get('ssh_host', '')
             if not host or host.startswith('-') or any(c.isspace() for c in host):
                 raise ValueError('An OpenSSH host alias is required')
@@ -126,8 +124,8 @@ def load(path):
         if not isinstance(values, list) or any(v not in {n.id for n in nodes} for v in values):
             raise ValueError(f'Invalid simulator {name}')
     if backend == 'bosc-resident':
-        if len(nodes) != 1 or any(p > 7 for p in nodes[0].ports):
-            raise ValueError('bosc-resident requires one local node with ports in 0..7')
+        if len(nodes) != 1:
+            raise ValueError('bosc-resident requires one local node')
         if nodes[0].ssh_host or nodes[0].relay_command:
             raise ValueError('bosc-resident does not use SSH or a relay')
         if not Path(nodes[0].uvhs_shell).is_absolute():
@@ -138,11 +136,15 @@ def load(path):
     fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout',
               'uart_quiet_seconds', 'recovery_attempts', 'recovery_backoff',
               'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile', 'shared_clock_index',
-              'output_ddr_base', 'output_ddr_bytes', 'max_output_bytes', 'explicit_allocation',
+              'output_ddr_base', 'output_ddr_bytes', 'max_output_bytes', 'explicit_allocation', 'init_scripts',
               'keep_load_files', 'storage_retry_seconds'}
     if set(resident) - fields:
         raise ValueError('Unknown resident options')
     if backend == 'bosc-resident':
+        if 'explicit_allocation' in resident:
+            raise ValueError('resident.explicit_allocation is no longer supported; remove it and provide '
+                             '[resident.init_scripts] with the verified allocation/load_db commands '
+                             'and their original order in each deployment initialization Tcl')
         if resident.get('profile', 'nh-only') != 'nh-only':
             raise ValueError('Only the nh-only resident profile is supported')
         if not resident.get('hardware_project') or not resident.get('lock_dir'):
@@ -152,6 +154,38 @@ def load(path):
             if not isinstance(resident[name], str) or not resident[name] or any(c in resident[name] for c in ('\x00', '\n', '\r')):
                 raise ValueError(f'Invalid resident {name}')
             resident[name] = str((path.parent / resident[name]).resolve())
+    if backend == 'bosc-resident' or 'init_scripts' in resident:
+        scripts = resident.get('init_scripts')
+        if not isinstance(scripts, dict) or not scripts:
+            raise ValueError('resident.init_scripts is required; configure one initialization Tcl path '
+                             'per allowlisted FPGA, e.g. [resident.init_scripts] then "4" = "init/init4.tcl"; '
+                             'legacy hw_runN.tcl extraction is no longer used')
+        # Validate and resolve every registered path, including disabled ports.
+        # Resident validates Tcl content/target compatibility only for nodes.ports.
+        resolved = {}
+        for port, value in scripts.items():
+            if not isinstance(port, str) or not re.fullmatch(r'0|[1-9][0-9]*', port):
+                raise ValueError('resident.init_scripts keys must be quoted nonnegative port numbers')
+            if (not isinstance(value, str) or not value.strip()
+                    or any(c in value for c in ('\x00', '\n', '\r', '$'))):
+                raise ValueError(f'Invalid resident.init_scripts.{port}: use a literal path; '
+                                 'environment variables are not expanded')
+            try:
+                script = Path(value).expanduser()
+                script = (path.parent / script).resolve()
+                if not script.is_file():
+                    raise ValueError('not a regular file')
+                with script.open('rb'):
+                    pass
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError(f'resident.init_scripts.{port} must name an existing readable file: '
+                                 f'{value} ({exc})') from exc
+            resolved[int(port)] = str(script)
+        if backend == 'bosc-resident' and not set(nodes[0].ports) <= set(resolved):
+            missing = sorted(set(nodes[0].ports) - set(resolved))
+            raise ValueError('resident.init_scripts must include every enabled port in nodes.ports '
+                             f'(missing={missing}); additional scripts may be registered for disabled ports')
+        resident['init_scripts'] = resolved
     if ('shared_clock_index' in resident and
             (type(resident['shared_clock_index']) is not int or not 0 <= resident['shared_clock_index'] <= 23)):
         raise ValueError('shared_clock_index must be an integer in 0..23')
@@ -170,7 +204,7 @@ def load(path):
     if resident.get('output_ddr_bytes', 4194304) % 64:
         raise ValueError('output_ddr_bytes must be a multiple of 64')
     for name in fields - {'hardware_project', 'lock_dir', 'profile', 'shared_clock_index', 'output_ddr_base',
-                          'explicit_allocation', 'keep_load_files'}:
+                          'explicit_allocation', 'keep_load_files', 'init_scripts'}:
         if name in resident:
             positive(resident[name], name)
     for name in ('recovery_attempts', 'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes'):

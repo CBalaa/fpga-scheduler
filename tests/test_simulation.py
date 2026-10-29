@@ -77,6 +77,8 @@ class ImageTests(unittest.TestCase):
             self.assertEqual(config.bind, '127.0.0.1')
             self.assertEqual(config.token_file.stat().st_mode & 0o777, 0o600)
             self.assertEqual(config.nodes[0].uvhs_shell, str(root / 'state/sim/uvhs-sim'))
+            self.assertEqual(config.resident['init_scripts'], {5: str(root / 'init/init5.tcl')})
+            self.assertIn('load_db -db ./hw.dat -to {b1.f1}', (root / 'init/init5.tcl').read_text())
             with self.assertRaises(FileExistsError):
                 create_environment(root)
             config_file = Path(result['config'])
@@ -84,6 +86,38 @@ class ImageTests(unittest.TestCase):
                 'hardware_project = "./state/sim/project"', 'hardware_project = "/real/project"'))
             with self.assertRaisesRegex(ValueError, 'isolated localhost config'):
                 load_local_config(root)
+
+    @unittest.skipUnless(shutil.which('tclsh'), 'tclsh required')
+    def test_registered_scripts_remain_isolated_when_only_one_port_is_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'offline'
+            create_environment(root, ports=(6, 7))
+            config_file = root / 'config.local.toml'
+            config_file.write_text(config_file.read_text().replace('ports = [6, 7]', 'ports = [6]'))
+            config = load_local_config(root)
+            self.assertEqual(config.nodes[0].ports, (6,))
+            self.assertEqual(set(config.resident['init_scripts']), {6, 7})
+            external = Path(tmp) / 'external.tcl'
+            external.write_text('# disabled registrations must also stay isolated\n')
+            config_file.write_text(config_file.read_text().replace('./init/init7.tcl', str(external)))
+            with patch('subprocess.Popen') as popen:
+                with self.assertRaisesRegex(ValueError, 'isolated localhost config'):
+                    create_application(root)
+                popen.assert_not_called()
+
+    @unittest.skipUnless(shutil.which('tclsh'), 'tclsh required')
+    def test_external_initialization_script_is_rejected_by_local_harness(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / 'offline'
+            create_environment(root, ports=(4,))
+            external = Path(tmp) / 'external.tcl'
+            external.write_text('# existing external initialization file\n')
+            config = root / 'config.local.toml'
+            config.write_text(config.read_text().replace('./init/init4.tcl', str(external)))
+            with patch('subprocess.Popen') as popen:
+                with self.assertRaisesRegex(ValueError, 'isolated localhost config'):
+                    create_application(root)
+                popen.assert_not_called()
 
     @unittest.skipUnless(shutil.which('tclsh'), 'tclsh required')
     def test_existing_hardware_state_is_rejected_before_retiring_any_record(self):
@@ -203,7 +237,9 @@ class SimulationHTTPTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.app.server.serve_forever, kwargs={'poll_interval': .01})
         self.thread.start()
         self.client = Client(self.url, token_file=info['token_file'])
-        self.client.devices()
+        # Resident status is a read-only snapshot; background initialization
+        # must complete before a test captures the reusable session IDs.
+        eventually(lambda: all(p['available'] for p in self.client.devices()['devices']))
 
     def tearDown(self):
         self.client.close()

@@ -57,6 +57,10 @@ assert validate_artifacts([]) == []
         base = (PROJECT / 'configs/resident.example.toml').read_text()
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / 'config.toml'
+            init = Path(tmp) / 'init'
+            init.mkdir()
+            for number in (4, 5, 6, 7):
+                (init / f'init{number}.tcl').write_text('# configuration fixture\n')
             path.write_text(base)
             self.assertEqual(load(path).resident['output_ddr_bytes'], 4194304)
             for before, after in (('0x80000000', '0x80100000'),

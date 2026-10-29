@@ -122,7 +122,7 @@ def make_server(address, queue, images, token):
                                                       dispatcher_alive=alive, stopping=queue.stopping.is_set(),
                                                       hardware_checked=False, scheduler_error=queue.status_error, **storage))
                 elif self.command == 'GET' and route == '/devices':
-                    self.reply(200, queue.inventory())
+                    self.reply(200, queue.inventory_snapshot())
                 elif self.command == 'PUT' and session and not session[2]:
                     self.reply(200, queue.open_session(session[1], json.loads(self.body(4096))))
                 elif self.command == 'POST' and session and session[2] == '/heartbeat':
@@ -230,8 +230,7 @@ class Application:
         # Caller must stop serve_forever first. Stop accepting requests and
         # finish handlers before closing SQLite; drain running hardware work.
         if self.queue:
-            self.queue.stopping.set()
-            self.queue.wake.set()
+            self.queue.request_stop()
         if self.server:
             self.server.server_close()
         if self.queue:
@@ -247,8 +246,7 @@ class Application:
         def stop(signum, frame):
             if not stopped.is_set():
                 stopped.set()
-                self.queue.stopping.set()
-                self.queue.wake.set()
+                self.queue.request_stop()
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
 
         previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}

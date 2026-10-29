@@ -349,10 +349,12 @@ def run(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--fpga', type=int, choices=range(8), required=True)
+    parser.add_argument('--fpga', type=int, required=True)
     parser.add_argument('--workdir', required=True)
     parser.add_argument('test')
     args = parser.parse_args()
+    if args.fpga < 0:
+        parser.error('--fpga must be a nonnegative integer')
     if not args.test.startswith('test=') or not Path(args.test[5:]).is_absolute():
         parser.error('test must be an absolute bin path')
     return run(args)
