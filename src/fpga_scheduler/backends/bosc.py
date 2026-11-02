@@ -12,6 +12,8 @@ from ..models import BUSY_EXIT, BUSY_TOKEN
 
 class BOSC:
     supports_cancellation = False
+    # The deployed BOSC remote runtime agent accepts timeout 1..600 only.
+    max_timeout = 600
 
     def __init__(self, nodes, transfer_timeout=120):
         self.nodes = tuple(nodes)

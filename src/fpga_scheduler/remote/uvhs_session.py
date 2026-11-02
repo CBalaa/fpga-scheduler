@@ -14,12 +14,21 @@ import termios
 import time
 import uuid
 
+from . import ddr_window
 from .runner import Completion, ProtocolError, platform_error, MAX_OUTPUT_BYTES
 from ..models import Cancellation, CancelledError
 
 
 class CommandTimeout(RuntimeError):
     """An unacknowledged command cannot establish a reusable control channel."""
+
+    def __init__(self, message, *, memory_command=None):
+        super().__init__(message)
+        self.memory_command = memory_command
+
+
+class LoadDeadlineExceeded(TimeoutError):
+    """The bounded DDR input-load phase exceeded the resident load_timeout."""
 
 
 def atomic_json(path, value):
@@ -75,22 +84,31 @@ def group_members(record):
     return members
 
 
-def retire_record(path):
+def retire_group(record):
     """Retire only the exact UVHS process group this deployment recorded."""
-    record = json.loads(Path(path).read_text())
     if group_members(record):
-        os.killpg(record['pid'], signal.SIGTERM)
+        try:
+            os.killpg(record['pid'], signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # The group may exit between verification and signaling.
         deadline = time.monotonic() + 5
         while group_members(record) and time.monotonic() < deadline:
             time.sleep(.05)
         if group_members(record):
-            os.killpg(record['pid'], signal.SIGKILL)
+            try:
+                os.killpg(record['pid'], signal.SIGKILL)
+            except ProcessLookupError:
+                pass
         deadline = time.monotonic() + 5
         while group_members(record) and time.monotonic() < deadline:
             time.sleep(.05)
         if group_members(record):
             raise RuntimeError('Recorded UVHS descendants did not retire')
     return record
+
+
+def retire_record(path):
+    return retire_group(json.loads(Path(path).read_text()))
 
 
 class BoundedLog:
@@ -118,19 +136,27 @@ class BoundedLog:
 
 class Session:
     def __init__(self, node, number, directory, port_lock, *, startup_timeout=300,
-                 command_timeout=60, uart_quiet_seconds=.2, max_job_log_bytes=1048576,
-                 max_session_log_bytes=4194304, output_ddr_base=0x80000000,
-                 output_ddr_bytes=4194304, max_output_bytes=MAX_OUTPUT_BYTES, **_):
+                 command_timeout=60, load_timeout=600, verify_readback=True,
+                 output_ddr_read_mode='prefix', uart_quiet_seconds=.2,
+                 max_job_log_bytes=1048576, max_session_log_bytes=4194304,
+                 output_ddr_base=0x80000000, output_ddr_bytes=4194304,
+                 max_output_bytes=MAX_OUTPUT_BYTES, **_):
         self.node, self.number = node, number
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
         self.port_lock = port_lock
         self.startup_timeout, self.command_timeout = startup_timeout, command_timeout
+        self.load_timeout, self.verify_readback = load_timeout, verify_readback
         self.quiet, self.max_job_log = uart_quiet_seconds, max_job_log_bytes
         self.output_base, self.output_span = output_ddr_base, output_ddr_bytes
+        self.output_read_mode = output_ddr_read_mode
+        self.output_mode = output_ddr_read_mode
         self.max_output = max_output_bytes
         self.epoch, self.seq = uuid.uuid4().hex, 0
         self.process = None
+        self.process_identity = None
+        self.closed = self.retired = self.closing = False
+        self.closed_cleanly = False
         self.master = self.serial = None
         self.saved_attrs = None
         self.pending = b''
@@ -174,8 +200,9 @@ class Session:
                                             start_new_session=True, pass_fds=(self.port_lock.fileno(),))
         finally:
             os.close(slave)
-        atomic_json(self.record, dict(epoch=self.epoch, pid=self.process.pid,
-                                     start_ticks=fingerprint(self.process.pid), number=self.number, dirty=True))
+        self.process_identity = dict(epoch=self.epoch, pid=self.process.pid,
+                                     start_ticks=fingerprint(self.process.pid), number=self.number, dirty=True)
+        atomic_json(self.record, self.process_identity)
         self.command('source ' + tcl(snapshot), timeout=self.startup_timeout)
         self.downloads = 1
         # Do not repair a script that leaves CPU reset deasserted and then call
@@ -244,6 +271,14 @@ class Session:
                 return output[:match.start()]
         raise CommandTimeout('UVHS command acknowledgement deadline exceeded')
 
+    def memory_command(self, operation, script, *, timeout=None):
+        try:
+            return self.command(script, timeout=timeout)
+        except CommandTimeout as error:
+            # Only acknowledgement timeouts in these operations permit automatic
+            # shell replacement. CPU reset/abort failures retain quarantine policy.
+            raise CommandTimeout(str(error), memory_command=operation) from error
+
     def reset(self):
         output = self.command('reset -name cpu_reset -value 1\nquery -reset')
         return self.confirm_reset(output)
@@ -255,15 +290,26 @@ class Session:
             raise RuntimeError('CPU reset assertion was not confirmed by query -reset')
         return True
 
+    def _read_uart(self):
+        """Read available bytes; readiness can race a nonblocking tty read."""
+        try:
+            data = os.read(self.serial, 65536)
+        except OSError as error:
+            if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                return None
+            raise
+        if not data:
+            raise RuntimeError('UART disconnected')
+        return data
+
     def boundary(self):
         """Require a quiet UART while reset is asserted; discard complete old bytes."""
         deadline, quiet_since = time.monotonic() + max(2, self.quiet * 5), time.monotonic()
         discarded = 0
         while time.monotonic() < deadline:
-            if select.select([self.serial], [], [], min(.05, self.quiet))[0]:
-                data = os.read(self.serial, 65536)
-                if not data:
-                    raise RuntimeError('UART disconnected')
+            data = (self._read_uart()
+                    if select.select([self.serial], [], [], min(.05, self.quiet))[0] else None)
+            if data is not None:
                 discarded += len(data)
                 quiet_since = time.monotonic()
                 if discarded > self.max_job_log:
@@ -274,35 +320,31 @@ class Session:
         raise ProtocolError('UART did not become quiet while reset was asserted')
 
     def capture_outputs(self, outputs, directory):
-        """Read one bounded DDR prefix, then extract exact byte ranges.
+        """Read one bounded physical DDR window, then extract exact byte ranges.
 
-        Prefix reads deliberately use the same vendor memory ordering as the
-        established image readback. Arbitrary nonzero RTL slices are not assumed.
-        Caller owns the slot and has confirmed reset and application completion.
+        The caller owns the slot and has confirmed reset and application
+        completion. Prefix mode keeps the established verified `i_ddr[N-1:0]`
+        ordering from the configured base; window mode reads only the
+        64-byte-aligned slice around the declared outputs.
         """
         if not outputs:
             return []
         if sum(item['nbytes'] for item in outputs) > self.max_output:
             raise ValueError('Output total exceeds resident max_output_bytes')
-        end = self.output_base
-        for item in outputs:
-            address = int(item['address'], 16)
-            if not self.output_base <= address < address + item['nbytes'] <= self.output_base + self.output_span:
-                raise ValueError('Output lies outside the configured physical DDR window')
-            end = max(end, address + item['nbytes'])
-        size = (end - self.output_base + 63) // 64 * 64
+        read = ddr_window.plan(outputs, self.output_base, self.output_span, self.output_read_mode)
+        size = read['window_size']
         directory = Path(directory) / 'artifacts'
         directory.mkdir(exist_ok=True)
         snapshot = directory / '.snapshot.tmp'
         written, manifest = [], []
         try:
-            memory = f'nanhu_xilinx.i_ddr[{size // 64 - 1}:0]'
-            self.command('readmem -rtl ' + tcl(memory) + ' -file ' + tcl(snapshot) + ' -file_type bin')
+            memory = read['memory']
+            self.memory_command('readmem', 'readmem -rtl ' + tcl(memory) + ' -file ' + tcl(snapshot) + ' -file_type bin')
             if snapshot.stat().st_size != size:
                 raise RuntimeError('Output DDR snapshot length mismatch')
             with snapshot.open('rb') as source:
                 for item in outputs:
-                    source.seek(int(item['address'], 16) - self.output_base)
+                    source.seek(int(item['address'], 16) - read['window_start'])
                     data = source.read(item['nbytes'])
                     if len(data) != item['nbytes']:
                         raise RuntimeError('Output DDR data is truncated')
@@ -330,7 +372,9 @@ class Session:
         directory = Path(directory)
         directory.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        deadline = started + payload['timeout']
+        # Loading DDR images is bounded independently of the application
+        # execution deadline, which starts only when the CPU reset is released.
+        load_deadline = started + self.load_timeout
         result = dict(output='', uart_output='', node=self.node.id, seconds=0,
                       execution_status='platform_error', app_exit_code=None, exit_code=1,
                       details=dict(session=self.epoch, uvhs_pid=self.process.pid, fpga=self.number,
@@ -338,10 +382,19 @@ class Session:
         protocol, uart = Completion(), bytearray()
         reset_ok = False
         log = BoundedLog(directory / 'uart.raw.log', self.max_job_log)
+
+        def check_load_deadline():
+            if time.monotonic() >= load_deadline:
+                raise LoadDeadlineExceeded(
+                    f'DDR input load deadline exceeded after {self.load_timeout:g}s; '
+                    'application execution was not started')
+
         try:
             cancellation.check()
             self.reset()
+            check_load_deadline()
             result['details']['discarded_uart_bytes'] = self.boundary()
+            check_load_deadline()
             cancellation.check()
             content = image.read_bytes()
             if hashlib.sha256(content).hexdigest() != payload['sha256']:
@@ -351,17 +404,29 @@ class Session:
             padded.write_bytes(content + bytes(size - len(content)))
             memory = f'nanhu_xilinx.i_ddr[{size // 64 - 1}:0]'
             cancellation.check()
-            self.command('writemem -rtl ' + tcl(memory) + ' -file ' + tcl(padded) + ' -file_type bin\n'
-                         'readmem -rtl ' + tcl(memory) + ' -file ' + tcl(readback) + ' -file_type bin',
-                         timeout=max(.01, min(self.command_timeout, deadline - time.monotonic())))
+            check_load_deadline()
+            # Memory commands are bounded by the remaining load budget only; the
+            # execution command_timeout must not shorten a large DDR load.
+            self.memory_command('writemem', 'writemem -rtl ' + tcl(memory) + ' -file ' + tcl(padded) + ' -file_type bin',
+                                timeout=max(.01, load_deadline - time.monotonic()))
+            check_load_deadline()
             cancellation.check()
-            if readback.read_bytes() != padded.read_bytes():
-                raise RuntimeError('DDR readback differs from padded input')
-            result['details']['ddr_readback_matches'] = True
+            if self.verify_readback:
+                self.memory_command('readmem', 'readmem -rtl ' + tcl(memory) + ' -file ' + tcl(readback) + ' -file_type bin',
+                                    timeout=max(.01, load_deadline - time.monotonic()))
+                check_load_deadline()
+                cancellation.check()
+                if readback.read_bytes() != padded.read_bytes():
+                    raise RuntimeError('DDR readback differs from padded input')
+                result['details']['ddr_readback_matches'] = True
+            else:
+                result['details']['ddr_readback_skipped'] = True
             self.boundary()
+            check_load_deadline()
             cancellation.check()
-            if time.monotonic() >= deadline:
-                raise TimeoutError('Execution deadline exceeded before CPU release')
+            exec_started = time.monotonic()
+            result['details']['load_seconds'] = exec_started - started
+            deadline = exec_started + payload['timeout']
             atomic_json(directory / 'start-intent.json', dict(id=payload['id'], sha256=payload['sha256'],
                         node=self.node.id, fpga=self.number, session=self.epoch, time=time.time()))
             self.command('reset -name cpu_reset -value 0', timeout=max(.01, deadline - time.monotonic()),
@@ -370,14 +435,13 @@ class Session:
             while time.monotonic() < deadline:
                 cancellation.check()
                 if select.select([self.serial], [], [], .02)[0]:
-                    data = os.read(self.serial, 65536)
-                    if not data:
-                        raise RuntimeError('UART disconnected')
-                    log.write(data)
-                    uart.extend(data)
-                    protocol.feed(data)
-                    if protocol.result is not None and terminal_at is None:
-                        terminal_at = time.monotonic()
+                    data = self._read_uart()
+                    if data is not None:
+                        log.write(data)
+                        uart.extend(data)
+                        protocol.feed(data)
+                        if protocol.result is not None and terminal_at is None:
+                            terminal_at = time.monotonic()
                 if select.select([self.master], [], [], 0)[0]:
                     if platform_error(self._tool(0)):
                         raise RuntimeError('UVHS error during execution')
@@ -403,6 +467,8 @@ class Session:
             if reason:
                 result['details']['cancel_reason'] = reason
             result['details']['error'] = str(error)
+            if isinstance(error, LoadDeadlineExceeded):
+                result['details']['load_timeout_seconds'] = self.load_timeout
         except ProtocolError as error:
             result.update(execution_status='protocol_error', exit_code=1)
             result['details']['error'] = str(error)
@@ -411,6 +477,8 @@ class Session:
             result['details']['error'] = str(error)
             if isinstance(error, CommandTimeout):
                 result['details']['interrupted_status'] = 'timeout'
+                if error.memory_command:
+                    result['details']['memory_ack_timeout'] = error.memory_command
         finally:
             reason = cancellation.finish()
             if reason:
@@ -422,9 +490,9 @@ class Session:
                 # Parse bytes arriving during reset too: late duplicate terminal
                 # records cannot silently become a successful next task.
                 while select.select([self.serial], [], [], 0)[0]:
-                    data = os.read(self.serial, 65536)
-                    if not data:
-                        raise RuntimeError('UART disconnected')
+                    data = self._read_uart()
+                    if data is None:
+                        break
                     log.write(data)
                     uart.extend(data)
                     protocol.feed(data)
@@ -454,6 +522,8 @@ class Session:
                         result['details']['artifact_error'] = str(error)
                         if isinstance(error, CommandTimeout):
                             result['details']['interrupted_status'] = 'timeout'
+                            if error.memory_command:
+                                result['details']['memory_ack_timeout'] = error.memory_command
                 else:
                     result['details']['artifacts_skipped'] = 'Application completion or hardware cleanup was not successful'
             log.close()
@@ -467,8 +537,12 @@ class Session:
         return result, healthy
 
     def close(self):
-        clean = self.process is None
-        if self.process is not None:
+        if self.closed:
+            return self.closed_cleanly
+        clean = self.closed_cleanly if self.retired else self.process is None
+        graceful = not self.closing and not self.command_pending
+        self.closing = True
+        if self.process is not None and graceful:
             try:
                 self.reset()
                 os.write(self.master, b'exit\n')
@@ -485,18 +559,23 @@ class Session:
                 clean = self.process.wait(timeout=2) == 0
             except (OSError, RuntimeError, subprocess.TimeoutExpired):
                 clean = False
-            if self.process.poll() is None:
-                os.killpg(self.process.pid, signal.SIGTERM)
-                try:
-                    self.process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    os.killpg(self.process.pid, signal.SIGKILL)
-                    self.process.wait()
-        if self.record.exists():
-            try:
+        # Never submit reset or exit to an unacknowledged channel. TERM/KILL
+        # targets only the recorded process group, including its descendants.
+        # Keep UART/lock ownership if retirement cannot be proved; callers must
+        # not overwrite the record or start another shell in that case.
+        if self.process is not None and not self.retired:
+            if not self.process_identity or not self.process_identity.get('start_ticks'):
+                raise RuntimeError('UVHS process identity missing; cannot confirm retirement')
+            if self.record.exists():
+                recorded = json.loads(self.record.read_text())
+                if recorded != self.process_identity:
+                    raise RuntimeError('UVHS session record changed; refusing retirement')
                 retire_record(self.record)
-            except (OSError, RuntimeError):
-                clean = False
+            else:
+                retire_group(self.process_identity)
+            self.process.wait(timeout=2)
+        self.retired = True
+        self.closed_cleanly = clean
         if self.serial is not None:
             try:
                 if self.saved_attrs:
@@ -504,13 +583,18 @@ class Session:
                 fcntl.ioctl(self.serial, termios.TIOCNXCL)
             except (OSError, termios.error):
                 clean = False
-            os.close(self.serial)
+            descriptor, self.serial = self.serial, None
+            os.close(descriptor)
         if self.master is not None:
-            os.close(self.master)
+            descriptor, self.master = self.master, None
+            os.close(descriptor)
         self.control.close()
         self.port_lock.close()
-        if self.record.exists():
+        self.closed_cleanly = clean
+        if self.process is not None and self.record.exists():
             record = json.loads(self.record.read_text())
             record['closed_cleanly'] = clean
+            record['processes_retired'] = True
             atomic_json(self.record, record)
+        self.closed, self.closed_cleanly = True, clean
         return clean

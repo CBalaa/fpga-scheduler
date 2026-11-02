@@ -1,0 +1,63 @@
+# Example deployment for large whole-model bins (up to 256 MiB) and long executions.
+# Copy next to your token/init files and adjust every /path/to/... placeholder.
+# The authoritative field documentation is docs/resident-runtime.md and docs/api.md.
+backend = "bosc-resident"
+state_dir = "./state"
+token_file = "./service.token"
+bind = "127.0.0.1"
+port = 18765
+poll_interval = 1
+queue_capacity = 256
+cooldown_seconds = 5
+retention_days = 7
+# Slow uploads: 5 s heartbeat / 120 s lease; each image chunk also refreshes the lease.
+client_heartbeat_seconds = 5
+client_lease_seconds = 120
+
+# Allow a whole-model bin (256 MiB here). Must stay below max_storage_bytes / 2.
+max_image_bytes = 268435456
+# Socket read timeout for one image chunk request; raise for slow SSH tunnels.
+upload_timeout = 300
+
+[resident]
+profile = "nh-only"
+hardware_project = "/home/USER/Desktop/fpga-tester"
+lock_dir = "/home/USER/fpga-scheduler-runtime/scheduler-locks"
+shared_clock_index = 6
+startup_timeout = 300
+# Ordinary Tcl command acknowledgement bound.
+command_timeout = 60
+# Reset + DDR writemem + optional readback + UART boundary for an 87 MiB image.
+# Measure the first load and set this above the observed worst case (max 86400).
+load_timeout = 1800
+# Keep full readback for the first runs of a new image; disable only to shave one DDR pass.
+verify_readback = true
+recovery_attempts = 5
+recovery_backoff = 10
+max_job_log_bytes = 1048576
+max_session_log_bytes = 4194304
+# Inputs and resident scratch each get half of this. An 87 MiB image needs ~176 MiB of
+# writemem/readback scratch, and prefix output snapshots can be several hundred MiB.
+max_storage_bytes = 4294967296
+storage_retry_seconds = 10
+keep_load_files = false
+
+# Physical DDR window. i_ddr[0] maps to output_ddr_base (64-byte aligned). The window
+# must contain every declared output address; base + span <= 4 GiB. With logits at
+# 0xa6e00080 a span of 1 GiB covers them; use output_ddr_read_mode = "window" (after the
+# one-time A/B hardware validation in docs/outputs.md) to avoid a ~622 MiB snapshot.
+output_ddr_base = 0x80000000
+output_ddr_bytes = 1073741824
+output_ddr_read_mode = "prefix"
+# Aggregate exported bytes per task (logits etc.); protocol ceiling is 256 MiB.
+max_output_bytes = 67108864
+
+# Register the deployment-owned initialization Tcl for every enabled port.
+[resident.init_scripts]
+"4" = "./init/init4.tcl"
+
+[[nodes]]
+id = "local"
+ports = [4]
+uvhs_shell = "/home/USER/uv0/uv_shell/bin/uvhs2_shell"
+uart_prefix = "/dev/FPGA"

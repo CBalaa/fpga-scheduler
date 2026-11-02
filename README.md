@@ -78,9 +78,13 @@ TOML
 
 同板其他 FPGA 有 owner、booked 或受管会话时，必须只读确认该板 `shared_clock_index` 的实际频率为 NH 要求的 5529600 Hz，才允许原样执行初始化 Tcl；频率未知或不匹配时拒绝初始化。含时钟配置/commit 的脚本还要求同板 FPGA 信息完整；同板完整且没有其他活动端口时，允许脚本配置时钟。未含时钟配置的脚本始终要求现有频率已匹配。这些是频率兼容性检查，scheduler 不省略或改写脚本中的时钟命令，也不据此保证同频 commit 在硬件上没有瞬态影响。
 
-设备发现按 UVHS 实际返回的单元数量工作，不要求固定八个 FPGA。`ports` 是本机要管理的端口白名单，例如 `[4]`；编号保持 `B0.F0–F3 → 0–3`、`B1.F0–F3 → 4–7`，后续板依此递增，不按查询行顺序重新编号。配置的目标未出现在查询结果中时会明确报告缺失；同板信息不完整时不能据此修改共享时钟。每个配置端口仍须有对应 UART 和独立初始化 Tcl。
+设备发现不要求固定八个 FPGA。`ports` 是本机要管理的端口白名单，例如 `[4]`；编号保持 `B0.F0–F3 → 0–3`、`B1.F0–F3 → 4–7`，后续板依此递增，不按查询行顺序重新编号。每个配置端口仍须有对应 UART 和独立初始化 Tcl。
+
+对 runtime 分区会随会话挂接/移除的 UVHS 主机，可在现有 `[resident]` 表内配置 `topology_boards = {"0" = "TB1", "1" = "TB2"}`。这是须在目标主机核验的 B→TB 映射示例，不是按 TB 编号减一的规则；键须覆盖所有启用端口所属的 B 板，值须唯一。启用后交叉核验 topology、物理 `query -fpgas -all -tb` 与普通 runtime 查询，并按相同映射读取 `query -clock -tb`：runtime 缺行可以表示分区未挂接，只有完整的物理发现、目标占用/预约与共享时钟检查通过才允许初始化。任一来源显示占用或预约即阻塞，缺行不代表空闲；映射冲突、物理信息缺失或厂商不支持所需选项时明确拒绝初始化。未配置该项时保留原 runtime inventory 模式。详见 [Resident 运行说明](docs/resident-runtime.md)。
 
 一次初始化后保留同一 UVHS shell：每任务确认 CPU 复位、写入 bin、DDR 回读校验、释放复位、收集输出并判断完成、再次确认 CPU 复位。连续正常任务不重新下载 bitstream，也不执行完整 `hw_runN.tcl`。正常停止按清理流程释放资源并退出 shell；故障恢复需要重建会话时才重新执行配置的初始化 Tcl。
+
+大于 16 MiB 的整模型 bin 可以直接提交：SDK 自动分片、断点续传并流式计算 SHA256，每个分片请求同时续租；镜像上限由顶层 `max_image_bytes` 配置（可到 4 GiB）。执行期限 `--timeout` 上限 86400 秒且只计算应用执行时间，DDR 装载由 `[resident].load_timeout` 单独限制。远地址输出（例如 logits 在 0xa6e00080）需要扩大 `output_ddr_bytes`，或在完成一次性硬件 A/B 校验后使用 `output_ddr_read_mode = "window"` 只读输出附近区域。完整配置见 [大镜像与大模型运行](docs/resident-runtime.md#大镜像与大模型运行) 和 [DDR 输出](docs/outputs.md)。
 
 登记好所有初始化文件后，切换端口只需用**旧配置先停止** daemon、确认目标空闲、修改 `ports` 后启动。例如在 fpga113 从 FPGA6 切到 FPGA7：
 
@@ -123,6 +127,8 @@ fpga-scheduler daemon start
 新终端先执行 `. "$HOME/fpga-resident-deploy/env.sh"`，也可将它加入 `~/.bashrc`。`FPGA_SCHEDULER_CONFIG` 指定默认配置，显式 `--config` 优先。修改配置前先用原配置正常停止，再修改并启动。首次硬件初始化可能需要几分钟，期间状态查询可能超时，稍后重试。SSH 断开后服务继续运行，主机重启后需重新启动。
 
 CLI 默认显示状态摘要和表格；脚本读取原始数据时加上 `--json`，例如 `fpga-scheduler daemon status --json` 或 `fpga-scheduler jobs --json`。
+
+提交任务时可用 `fpga-scheduler run path/to/hello.bin --name "hello 测试"` 指定名称（`submit` 同样支持）。省略 `--name` 或传入空白名称时，默认名称为二进制文件名，例如 `hello.bin`。`jobs` 表格最左侧的 `TASK` 列显示任务名称，历史任务没有保存名称时显示 `-`。
 
 存储配额不足时任务保持排队，`jobs/job` 显示原因及用量，容量恢复后自动继续；超过 `--queue-timeout` 才失败。`daemon status` 可查看配额，管理员可调整 `[resident].max_storage_bytes`（默认 1 GiB，输入与运行文件各占一半）或顶层 `retention_days` 后正常重启。安全收尾后的临时镜像/readback 默认自动回收，输入、UART 和导出文件仍按保留期保存，详见[存储说明](docs/resident-runtime.md#存储验收与限制)。
 
@@ -190,6 +196,8 @@ print(result.execution_status, result.app_exit_code, result.ok)
 流模式下由调用者打印，`show` 不自动打印；同步模式下 `show=True` 自动实时打印，`show=False` 静默等待。文本块不一定是一整行。HTTP 默认每 0.2 秒增量读取 UART（可设 `poll_interval`），回环和局域网用法相同。升级需同时更新 daemon 与 SDK，再正常重启服务。Simulator 在任务结束时提供输出；旧 SSH 后端不支持新租约提交，会明确报错。
 
 CLI 自动读取上述环境变量；Python 脚本通过 `os.environ` 显式传入。**提交客户端退出即取消其未结束任务**：正常退出、Ctrl+C、未捕获异常尽量主动通知；崩溃、SIGKILL 或断网由租约到期兜底。默认每 2 秒心跳、15 秒失联取消；服务端配置如第 2 节，SDK 也可传 `heartbeat_seconds=2, lease_seconds=15`。心跳在后台自动运行，不依赖读取输出；关闭流或等待超时本身不取消，超过租约的断网会取消。其他客户端查询、读输出不会续租。
+
+Python SDK 的 `submit()` / `run_test()` 可传入 `name="hello 测试"`，省略时也默认使用文件名；通过 `task.name` 读取保存的名称。
 
 `submit()` 只提交、不等待，适合同一进程批量提交；脚本必须继续运行并等待，直接退出会取消。`run_test()` 默认返回输出流；`Client.close()` 或退出 `with Client(...)` 会取消该 Client 的未结束任务。没有脱离客户端运行模式：
 

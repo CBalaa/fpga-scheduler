@@ -74,6 +74,19 @@ class LeaseQueueTests(unittest.TestCase):
             self.submit(2)
         self.assertEqual(self.q.cancel(task['id'])['state'], 'cancelled')
 
+    def test_touch_session_refreshes_lease_and_rejects_expired_identity(self):
+        # Chunked upload requests call touch_session instead of the heartbeat route.
+        with self.q.lock, self.q.db:
+            self.q.db.execute('UPDATE client_sessions SET heartbeat=? WHERE id=?',
+                              (time.time() - .2, self.owner))
+        self.assertEqual(self.q.touch_session(self.owner), dict(id=self.owner, state='active'))
+        time.sleep(.15)
+        # The touch moved the lease window forward before the old deadline passed.
+        self.assertEqual(self.q.heartbeat(self.owner)['state'], 'active')
+        self.expire()
+        with self.assertRaises(Conflict):
+            self.q.touch_session(self.owner)
+
     def test_preparation_cancel_does_not_start_or_release_slot_early(self):
         entered, release = threading.Event(), threading.Event()
         original = self.backend.prepare

@@ -16,9 +16,11 @@ from urllib.error import HTTPError
 from urllib.request import Request, ProxyHandler, build_opener
 
 from fpga_scheduler import Client, SchedulerError
+from fpga_scheduler.artifacts import validate_artifacts
 from fpga_scheduler.cli import main
 from fpga_scheduler.config import load
-from fpga_scheduler.remote.runner import Completion, ProtocolError, output_declaration
+from fpga_scheduler.remote.runner import (
+    Completion, MAX_OUTPUT_BYTES, MAX_OUTPUTS, ProtocolError, output_declaration)
 
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT / 'tools'))
@@ -62,18 +64,86 @@ assert validate_artifacts([]) == []
             for number in (4, 5, 6, 7):
                 (init / f'init{number}.tcl').write_text('# configuration fixture\n')
             path.write_text(base)
-            self.assertEqual(load(path).resident['output_ddr_bytes'], 4194304)
-            for before, after in (('0x80000000', '0x80100000'),
-                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = true'),
+            resident = load(path).resident
+            self.assertEqual(resident['output_ddr_base'], 0x80000000)
+            self.assertEqual(resident['output_ddr_bytes'], 4194304)
+            self.assertEqual(resident['output_ddr_read_mode'], 'prefix')
+            self.assertIs(resident['verify_readback'], True)
+            self.assertEqual(resident['load_timeout'], 600)
+            self.assertEqual(resident['max_output_bytes'], 16777216)
+            # C3 bounds: nonzero/any-64-aligned base inside 4 GiB, 64 B..2 GiB span,
+            # prefix|window mode, bool readback, load_timeout 0<t<=86400 and a
+            # 256 MiB max_output_bytes deployment cap.
+            for before, after, expected in (
+                    ('output_ddr_base = 0x80000000', 'output_ddr_base = 0x80000040',
+                     {'output_ddr_base': 0x80000040}),
+                    ('output_ddr_base = 0x80000000', 'output_ddr_base = 0x0',
+                     {'output_ddr_base': 0}),
+                    ('output_ddr_base = 0x80000000', 'output_ddr_base = 0xa6e00000',
+                     {'output_ddr_base': 0xa6e00000}),  # covers the 87.3 MiB logits address
+                    ('output_ddr_base = 0x80000000', 'output_ddr_base = 0xffc00000',
+                     {'output_ddr_base': 0xffc00000}),  # base + span == 4 GiB exactly
+                    ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 64',
+                     {'output_ddr_bytes': 64}),
+                    ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 268435520',
+                     {'output_ddr_bytes': 268435520}),  # 256 MiB + 64, within the 2 GiB span
+                    ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 652214464',
+                     {'output_ddr_bytes': 652214464}),  # covers physical 0xa6e00080 from base
+                    ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 2147483648',
+                     {'output_ddr_bytes': 2147483648}),  # 2 GiB span; base ends at exactly 4 GiB
+                    ('output_ddr_read_mode = "prefix"', 'output_ddr_read_mode = "window"',
+                     {'output_ddr_read_mode': 'window'}),
+                    ('verify_readback = true', 'verify_readback = false',
+                     {'verify_readback': False}),
+                    ('load_timeout = 600', 'load_timeout = 86400', {'load_timeout': 86400}),
+                    ('load_timeout = 600', 'load_timeout = 0.5', {'load_timeout': 0.5}),
+                    ('max_output_bytes = 16777216', 'max_output_bytes = 268435456',
+                     {'max_output_bytes': 268435456})):
+                with self.subTest(after=after):
+                    path.write_text(base.replace(before, after))
+                    configured = load(path).resident
+                    self.assertEqual({key: configured[key] for key in expected}, expected)
+            for before, after in (('output_ddr_base = 0x80000000', 'output_ddr_base = true'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = true_value'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = 65'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = 1'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = -64'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = 0x100000000'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = 0xffc00040'),
+                                  ('output_ddr_base = 0x80000000', 'output_ddr_base = 0x7fffffffc0'),
+                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 0'),
+                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 32'),
                                   ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 65'),
-                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 268435520'),
+                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 2147483712'),
                                   ('output_ddr_bytes = 4194304', 'output_ddr_bytes = 64.0'),
+                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = "4194304"'),
+                                  ('output_ddr_bytes = 4194304', 'output_ddr_bytes = true'),
+                                  ('output_ddr_read_mode = "prefix"', 'output_ddr_read_mode = "slice"'),
+                                  ('output_ddr_read_mode = "prefix"', 'output_ddr_read_mode = "PREFIX"'),
+                                  ('output_ddr_read_mode = "prefix"', 'output_ddr_read_mode = "window "'),
+                                  ('output_ddr_read_mode = "prefix"', 'output_ddr_read_mode = 1'),
+                                  ('verify_readback = true', 'verify_readback = 0'),
+                                  ('verify_readback = true', 'verify_readback = 1'),
+                                  ('verify_readback = true', 'verify_readback = "true"'),
+                                  ('load_timeout = 600', 'load_timeout = 0'),
+                                  ('load_timeout = 600', 'load_timeout = -1'),
+                                  ('load_timeout = 600', 'load_timeout = 86401'),
+                                  ('load_timeout = 600', 'load_timeout = "600"'),
+                                  ('load_timeout = 600', 'load_timeout = true'),
                                   ('max_output_bytes = 16777216', 'max_output_bytes = 0'),
-                                  ('max_output_bytes = 16777216', 'max_output_bytes = 16777217')):
+                                  ('max_output_bytes = 16777216', 'max_output_bytes = -1'),
+                                  ('max_output_bytes = 16777216', 'max_output_bytes = 268435457'),
+                                  ('max_output_bytes = 16777216', 'max_output_bytes = 16777216.0'),
+                                  ('max_output_bytes = 16777216', 'max_output_bytes = true')):
                 with self.subTest(after=after):
                     path.write_text(base.replace(before, after))
                     with self.assertRaises(ValueError):
                         load(path)
+            # 2 GiB span plus a nonzero base exceeds the 4 GiB address space.
+            path.write_text(base.replace('output_ddr_base = 0x80000000', 'output_ddr_base = 0x80000040')
+                            .replace('output_ddr_bytes = 4194304', 'output_ddr_bytes = 2147483648'))
+            with self.assertRaisesRegex(ValueError, '4 GiB'):
+                load(path)
 
     def test_fragmentation_and_strict_record_order(self):
         parser = Completion()
@@ -130,6 +200,90 @@ int main(void) {
         parser.feed(START + data + RESULT)
         parser.finish()
         self.assertEqual(parser.outputs, [declaration()])
+
+
+class ProtocolLimitTests(unittest.TestCase):
+    """C3: the UART protocol ceiling is 256 MiB; the deployment cap may be lower."""
+
+    @staticmethod
+    def output(index=0, nbytes=4, dtype='|u1', shape=None):
+        shape = [nbytes] if shape is None else shape
+        return dict(version=1, name=f'O{index}', address=hex(0x80000000 + index * 0x10000000),
+                    nbytes=nbytes, dtype=dtype, shape=shape)
+
+    @classmethod
+    def record(cls, index=0, **fields):
+        return ('@@FPGA_OUTPUT ' + json.dumps(cls.output(index, **fields)) + '\n').encode()
+
+    @staticmethod
+    def artifact(index, nbytes):
+        value = ProtocolLimitTests.output(index, nbytes=nbytes)
+        value.pop('version')
+        value['sha256'] = '0' * 64
+        return value
+
+    def test_named_protocol_ceiling_is_256_mib_and_output_count_stays_16(self):
+        self.assertEqual(MAX_OUTPUT_BYTES, 256 * 1024 * 1024)
+        self.assertEqual(MAX_OUTPUTS, 16)
+
+    def test_single_declaration_beyond_the_old_16_mib_limit_is_accepted(self):
+        ceiling = MAX_OUTPUT_BYTES
+        for size in (16 * 1024 * 1024 + 1, 64 * 1024 * 1024, ceiling - 1, ceiling):
+            with self.subTest(size=size):
+                self.assertEqual(output_declaration(self.output(nbytes=size))['nbytes'], size)
+        for changes in (dict(nbytes=ceiling + 1), dict(nbytes=ceiling + 64),
+                        dict(nbytes=8, dtype='<f8', shape=[ceiling // 8 + 1])):
+            with self.subTest(changes=changes), self.assertRaises(ProtocolError):
+                output_declaration(self.output(**changes))
+
+    def test_shape_dimension_ceiling_matches_the_byte_ceiling(self):
+        self.assertEqual(output_declaration(self.output(nbytes=MAX_OUTPUT_BYTES))['shape'],
+                         [MAX_OUTPUT_BYTES])
+        # 64 MiB of <f8 is 8,388,608 elements: well past the old 16 MiB element bound.
+        value = self.output(nbytes=64 * 1024 * 1024, dtype='<f8', shape=[8 * 1024 * 1024])
+        self.assertEqual(output_declaration(value)['nbytes'], 64 * 1024 * 1024)
+        for shape in ([MAX_OUTPUT_BYTES + 1], [2 ** 40]):
+            with self.subTest(shape=shape), self.assertRaises(ProtocolError):
+                output_declaration(self.output(nbytes=4, shape=shape))
+
+    def test_completion_accepts_256_mib_aggregate_and_rejects_one_byte_more(self):
+        start = b'@@FPGA_START {"version":1}\n'
+        half = MAX_OUTPUT_BYTES // 2
+        parser = Completion()
+        parser.feed(start + self.record(0, nbytes=half) + self.record(1, nbytes=half))
+        self.assertEqual([item['nbytes'] for item in parser.outputs], [half, half])
+        parser = Completion()
+        parser.feed(start + self.record(0, nbytes=MAX_OUTPUT_BYTES))
+        self.assertEqual(parser.outputs[0]['nbytes'], MAX_OUTPUT_BYTES)
+        parser = Completion()
+        with self.assertRaisesRegex(ProtocolError, 'Output count/total byte limit exceeded'):
+            parser.feed(start + self.record(0, nbytes=half) + self.record(1, nbytes=half)
+                        + self.record(2, nbytes=1))
+
+    def test_completion_keeps_the_16_output_limit(self):
+        start = b'@@FPGA_START {"version":1}\n'
+        data = start + b''.join(self.record(index, nbytes=1) for index in range(MAX_OUTPUTS))
+        parser = Completion()
+        parser.feed(data)
+        self.assertEqual(len(parser.outputs), MAX_OUTPUTS)
+        parser = Completion()
+        with self.assertRaisesRegex(ProtocolError, 'Output count/total byte limit exceeded'):
+            parser.feed(data + self.record(MAX_OUTPUTS, nbytes=1))
+
+    def test_artifact_manifest_uses_the_same_ceiling(self):
+        half = MAX_OUTPUT_BYTES // 2
+        items = [self.artifact(0, half), self.artifact(1, half)]
+        self.assertIs(validate_artifacts(items), items)
+        self.assertEqual(validate_artifacts([self.artifact(0, 16 * 1024 * 1024 + 4)])[0]['nbytes'],
+                         16 * 1024 * 1024 + 4)
+        self.assertEqual(validate_artifacts([self.artifact(0, MAX_OUTPUT_BYTES)])[0]['nbytes'],
+                         MAX_OUTPUT_BYTES)
+        with self.assertRaisesRegex(ValueError, 'Artifact total byte limit exceeded'):
+            validate_artifacts(items + [self.artifact(2, 1)])
+        with self.assertRaises(ValueError):
+            validate_artifacts([self.artifact(0, MAX_OUTPUT_BYTES + 1)])
+        with self.assertRaisesRegex(ValueError, 'Invalid artifact manifest'):
+            validate_artifacts([self.artifact(index, 1) for index in range(MAX_OUTPUTS + 1)])
 
 
 @unittest.skipUnless(shutil.which('tclsh'), 'Tcl required for offline DDR capture')
@@ -272,3 +426,76 @@ class ArtifactHTTPTests(unittest.TestCase):
         self.app.queue.images.cleanup(time.time() + 100)
         self.app.backend.cleanup(time.time() + 100)
         self.assertFalse(artifact.exists())
+
+
+@unittest.skipUnless(shutil.which('tclsh'), 'Tcl required for offline DDR capture')
+class SimDDRReadmemTests(unittest.TestCase):
+    """The software UVHS stores a 64-byte RTL element per i_ddr index; both read
+    modes (prefix i_ddr[hi:0] and window i_ddr[hi:lo]) must slice that image."""
+
+    SCRIPT = PROJECT / 'tools/fpga_sim_support/uvhs.tcl'
+
+    def readmem(self, rtl, elements=8):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = bytes((index * 37 + 11) % 256 for index in range(elements * 64))
+            (root / 'sim-ddr.bin').write_bytes(image)
+            target = root / 'read.bin'
+            script = '\n'.join((
+                'set loaded {' + str(root / 'image.bin') + '}',
+                'set released 1',
+                'readmem -rtl {' + rtl + '} -file {' + str(target) + '} -file_type bin',
+            )) + '\n'
+            process = subprocess.run(['tclsh', str(self.SCRIPT), '-workdir', str(root)],
+                                     input=script, text=True, capture_output=True, timeout=30)
+            data = target.read_bytes() if target.is_file() else None
+            return process, data, image
+
+    def test_prefix_i_ddr_hi_0_reads_elements_from_the_start(self):
+        process, data, image = self.readmem('nanhu_xilinx.i_ddr[2:0]')
+        self.assertEqual(process.stderr, '')
+        self.assertEqual(data, image[:3 * 64])
+
+    def test_window_i_ddr_hi_lo_slices_stored_elements(self):
+        for high, low in ((2, 1), (7, 4), (5, 5)):
+            with self.subTest(high=high, low=low):
+                process, data, image = self.readmem(
+                    f'nanhu_xilinx.i_ddr[{high}:{low}]')
+                self.assertEqual(process.stderr, '')
+                self.assertEqual(data, image[low * 64:(high + 1) * 64])
+
+    def test_invalid_memory_range_reports_an_error_without_writing(self):
+        process, data, _ = self.readmem('nanhu_xilinx.i_ddr[2]')
+        self.assertIn('invalid memory range', process.stderr)
+        self.assertIsNone(data)
+
+
+class DeploymentCapTests(unittest.TestCase):
+    """256 MiB is only the protocol ceiling; resident.max_output_bytes caps exports."""
+
+    def session(self, directory, **options):
+        from fpga_scheduler.remote.uvhs_session import Session
+        return Session(None, 4, directory, object(), **options)
+
+    def test_capture_enforces_the_configured_deployment_cap(self):
+        declaration = dict(version=1, name='C', address='0x80000000',
+                           nbytes=16 * 1024 * 1024 + 1, dtype='|u1',
+                           shape=[16 * 1024 * 1024 + 1])
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            session = self.session(directory, max_output_bytes=16 * 1024 * 1024)
+            try:
+                self.assertEqual(session.max_output, 16 * 1024 * 1024)
+                with self.assertRaisesRegex(ValueError, 'max_output_bytes'):
+                    session.capture_outputs([declaration], directory)
+            finally:
+                session.control.close()
+
+    def test_unconfigured_session_defaults_to_the_protocol_ceiling(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            session = self.session(directory)
+            try:
+                self.assertEqual(session.max_output, MAX_OUTPUT_BYTES)
+            finally:
+                session.control.close()

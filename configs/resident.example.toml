@@ -9,6 +9,12 @@ cooldown_seconds = 5
 retention_days = 7
 client_heartbeat_seconds = 2
 client_lease_seconds = 15
+# Largest image accepted for one task (default 16 MiB matches legacy single-shot PUT).
+# Large whole-model bins should raise this; uploads are chunked and resumable and each
+# chunk refreshes the client lease. Keep it below resident.max_storage_bytes / 2.
+max_image_bytes = 16777216
+# Socket read timeout for image upload/download requests (seconds).
+upload_timeout = 120
 
 [resident]
 profile = "nh-only"
@@ -16,6 +22,14 @@ hardware_project = "/path/to/existing-hardware-project"
 # Shared with every legacy/resident deployment that can operate these ports.
 # Administrator provisions directory access for the service account.
 lock_dir = "/path/to/shared/scheduler-locks"
+# Optional: enable physical topology discovery on UVHS hosts whose runtime
+# partitions appear/disappear with sessions. Verify this mapping on that host;
+# B0 is not assumed to mean TB1, and query row order never assigns board IDs.
+# Keys are logical B-board numbers used by nodes.ports and initialization Tcl;
+# values are distinct physical topology board IDs. Cover every enabled board.
+# topology_boards = {"0" = "TB1", "1" = "TB2"}
+# This mode requires topology and physical -tb status/clock queries. Missing,
+# unsupported or conflicting data blocks initialization; it never assumes free.
 # Physical clock output used by sys_clk; verify against the hardware project.
 # The initialization Tcl must agree with the NH profile and this clock index.
 # Original Tcl commands are never removed to work around a shared clock conflict.
@@ -23,7 +37,7 @@ shared_clock_index = 6
 startup_timeout = 300
 command_timeout = 60
 uart_quiet_seconds = 0.2
-recovery_attempts = 3
+recovery_attempts = 5
 recovery_backoff = 10
 max_job_log_bytes = 1048576
 max_session_log_bytes = 4194304
@@ -34,11 +48,24 @@ storage_retry_seconds = 10
 # Remove padded image/readback copies after verified DDR readback and reset.
 # Inputs, UART, durable results and exported artifacts retain retention_days.
 keep_load_files = false
+# Time allowed for reset + DDR writemem + optional readback + UART boundary before
+# CPU release. It is not deducted from a task's execution timeout. Raise it for large
+# images: the whole load phase must fit in one bounded window.
+load_timeout = 600
+# Verify padded image contents with a full readback. Costs a second DDR pass; disable
+# only after measuring a profile, and keep it enabled for first runs of a new image.
+verify_readback = true
 # Application-declared output must fit this physical DDR window.
-# Base is fixed by the NH profile. Span must be a multiple of 64, at most 256 MiB.
+# Base is the physical address of i_ddr[0]; must be a multiple of 64.
+# Span must be a multiple of 64, at most 2 GiB, and base + span <= 4 GiB.
 output_ddr_base = 0x80000000
 output_ddr_bytes = 4194304
-# Aggregate exported bytes per task, at most 16 MiB / 16 named outputs.
+# "prefix" reads verified i_ddr[N:0] from output_ddr_base through the highest output;
+# the snapshot (and read time) grows with the output address. "window" reads only the
+# 64-byte-aligned span containing the declared outputs via i_ddr[hi:lo]; it keeps far
+# outputs cheap but nonzero RTL slices must be validated once on the target hardware.
+output_ddr_read_mode = "prefix"
+# Aggregate exported bytes per task, at most 256 MiB / 16 named outputs.
 max_output_bytes = 16777216
 
 # Register deployment-owned initialization Tcl files in advance. Every enabled

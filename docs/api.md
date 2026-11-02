@@ -12,8 +12,10 @@ Authorization: Bearer <token>。没有用户身份字段；令牌持有者可操
 | PUT /sessions/{id} | JSON `{}`，可含 heartbeat_seconds / lease_seconds；建立独立租约，返回实际期限 |
 | POST /sessions/{id}/heartbeat | 续租；已关闭或到期返回 409，不复活 |
 | DELETE /sessions/{id} | 关闭会话并请求取消其未结束任务；幂等 |
-| PUT /jobs/{id}/image | 原始 bin，1 byte–16 MiB；返回 id、sha256 |
-| POST /jobs | JSON id、sha256、timeout、idle_seconds、queue_timeout；须带 X-FPGA-Session；返回任务，202 |
+| PUT /jobs/{id}/image?offset=N | 分片原始 bin，1 B–8 MiB；返回 id、offset、next_offset；可选 X-FPGA-Session 续租 |
+| PUT /jobs/{id}/image | 兼容旧 SDK 的整文件 bin，1 B–min(16 MiB, max_image_bytes)；返回 id、sha256 |
+| GET /jobs/{id}/image | 上传状态 id、uploaded_bytes、max_image_bytes、complete；可选 X-FPGA-Session 续租 |
+| POST /jobs | JSON id、sha256、可选 name、timeout、idle_seconds、queue_timeout；须带 X-FPGA-Session；返回任务，202 |
 | GET /jobs/{id} | 单任务，200；不存在为 404 |
 | GET /jobs/{id}/output?offset=0&limit=65536 | 增量 UART 字节与任务快照，200；同样需要 token |
 | GET /jobs/{id}/artifacts | 终态任务的已保存 DDR 输出清单 `{id, artifacts}`；执行中为 409 |
@@ -35,6 +37,21 @@ queued/running/cancelling/completed/failed/cancelled 的组合。limit 范围 1�
 Resident 读取持续刷新且不轮转的分任务 UART 文件；不会读取 UVHS 控制日志或旧任务输出。
 Simulator 和旧 SSH 后端兼容此接口，但只能在结束后返回输出。
 
+大镜像使用分片上传：`PUT /jobs/{id}/image?offset=N` 从已持久化字节偏移续写，返回
+`next_offset`。`offset` 大于已收字节为 409；`offset` 小于已收字节时，只有已落盘内容是
+本次分片的完全前缀才按幂等重试补写缺失字节，内容不一致返回 409。客户端断线后先
+`GET /jobs/{id}/image` 取得 `uploaded_bytes` 再续传，已成功落盘的字节不会重传。
+分片请求可带 `X-FPGA-Session`：服务端校验会话仍有效并顺带续租，慢速上传不会因租约
+到期被取消；会话已过期返回 409，需新建 Client。镜像总大小受部署 `max_image_bytes`
+（默认 16 MiB，可配到 4 GiB）与输入存储配额约束，超过返回 400/503。旧 daemon 不支持
+分片，新 SDK 对超过 16 MiB 的镜像会明确提示升级 daemon。
+
+分片上传的错误语义：偏移大于已落盘字节返回 409（说明已收字节数）；重试分片与已落盘
+内容不一致返回 409；会话无效或已过期返回 409，需新建 Client；提交时 SHA256 不匹配或
+尚未上传完整返回 400；超过部署 max_image_bytes 返回 400；输入存储配额不足返回 503，
+`error_details.error_code=input_storage_quota_exceeded`。SDK 对传输错误、5xx 和 409
+会先重新查询上传状态再从实际落盘偏移续传，超过 upload_attempts 后原样抛出最后一次错误。
+
 上传成功后显式提交；上传不会入队。提交校验输入的 SHA256，冻结后拒绝 PUT，
 即使内容相同也返回 409。重复 POST 的 ID 与全部规范化参数相同则返回现有任务；
 不同则为 409；提交会话也必须相同，其他客户端不能接管原任务。客户端可使用此规则恢复丢失的提交响应。幂等记录保留至任务清理。
@@ -54,17 +71,25 @@ BOSC SSH 后端尚不能安全运行中取消，因此会话建立返回 409；r
 {
   "id": "00000000000000000000000000000001",
   "sha256": "<64 lowercase hex characters>",
+  "name": "hello 测试",
   "timeout": 600,
   "idle_seconds": 60,
   "queue_timeout": 3600
 }
 ~~~
 
-ID 必须为 32 位小写十六进制。timeout 范围 1–600；idle_seconds 1–120；
+ID 必须为 32 位小写十六进制。timeout 范围 1–86400；idle_seconds 1–120；
 queue_timeout 1–86400，均为整数秒，不接受布尔值或额外字段。省略时默认
-600、60、3600。请求必须带 Content-Length；不支持 chunked 请求。
+600、60、3600。timeout 只表示应用执行期限（从释放 CPU 复位到收到终态 UART
+记录），不包含 DDR 装载；装载阶段由 daemon 的 `[resident].load_timeout` 单独
+限制（默认 600 秒，可配到 86400 秒）。旧 SSH BOSC 后端仍限制 1–600 秒；
+bosc-resident 与 simulator 支持到 86400 秒。请求必须带 Content-Length；不支持
+chunked 请求（镜像分片是多个独立带 Content-Length 的 PUT）。
 
-任务字段：id、state、created、started、finished、node、fpga、error。
+任务字段：id、name、state、created、started、finished、node、fpga、error。
+`name` 为提交时保存的任务名称；CLI / SDK 未指定名称或名称为空白时使用二进制文件名（含扩展名、不含目录）。
+自定义名称去除首尾空白后最多 255 个字符，不接受控制字符；名称属于不可变提交参数，同 ID 改名返回 409。
+原始 HTTP 上传不包含文件名，省略 `name` 的请求与历史任务返回 `name: null`。
 时间为 Unix 秒；未开始/结束和未分配字段为 null。排队任务另有 position（从 1
 开始）、waiting_reason。存在执行响应时另有 result：output、exit_code、node、seconds、
 execution_status、app_exit_code、details、uart_output。
@@ -115,9 +140,9 @@ node 为配置中的稳定节点 ID；available、reasons 给出当前可调度�
 from fpga_scheduler import Client, SchedulerError
 
 client = Client("http://127.0.0.1:8765", token_file="secrets/service.token")
-task = client.submit("input.bin", ident=None, timeout=600,
+task = client.submit("input.bin", ident=None, name="输入测试", timeout=600,
                      idle_seconds=60, queue_timeout=3600)
-print(task.id)
+print(task.id, task.name)
 page = client.jobs(("queued", "running"), limit=100, offset=0)
 state = client.job(task.id)
 devices = client.devices()
@@ -131,6 +156,13 @@ Result 有 output、node、exit_code、seconds、execution_status、app_exit_cod
 和 artifacts、ok 属性。jobs 返回分页原始字典，
 devices/health 返回原始字典。Client 的 request_timeout 是单次 HTTP 超时，默认 30 秒；
 wait(timeout=...) 是轮询等待期限，超时抛 SchedulerError，不会取消已提交任务。
+
+submit 以分块方式流式读取镜像并增量计算 SHA256，不把整个文件读入内存；
+Client(upload_chunk_bytes=4 * 1024 * 1024) 控制单次分片大小（1 B–8 MiB），
+upload_attempts 控制断点续传重试次数。上传的每个分片请求携带 X-FPGA-Session 并在
+服务端续租；request_timeout 也是单个分片请求的超时，慢速链路可调大。run_test 的流
+等待期限按 queue_timeout + timeout + 1800 秒计算（为 DDR 装载留出宽限），wait() 仍只
+按调用者给定 timeout 轮询。
 SchedulerError.status 为 HTTP 状态或 None；提交/等待错误携带 task_id 便于恢复查询。
 `SchedulerError.details` 保留结构化错误，`error_code` 为其错误码；没有结构化信息时为空字典 / None。
 `Task.waiting_details/error_details/retry_at` 支持存储等待与超时诊断，例如：
@@ -150,7 +182,7 @@ submit 上传后提交，仅在 POST 响应丢失时以同 ID 同参数重试一
 是否同一输入。输入上传或提交失败均通过异常附带 ID；先查 job 再决定是否重试。
 
 run_test(image, timeout=600, idle_seconds=60, queue_timeout=3600, show=True,
-         *, stream=True, poll_interval=0.2)
+         *, stream=True, poll_interval=0.2, name=None)
 封装提交和输出读取，立即打印 ID。默认返回 OutputStream；调用者迭代读取文本，
 读完后从 stream.result 取得最终 Result。需要同步等待并直接返回 Result 时，
 显式设置 stream=False；此时 show=True 自动增量打印 UART，show=False 静默等待。
@@ -198,7 +230,7 @@ fpga-scheduler [--endpoint URL] [--token-file PATH] [--json] <command>
 | init-token PATH | 以 600 权限创建随机令牌，拒绝覆盖 |
 | serve --config PATH | 启动单实例服务 |
 | daemon start/status/stop [--config PATH] | 启动、查看状态、正常停止；配置可由 FPGA_SCHEDULER_CONFIG 指定 |
-| run IMAGE [--id ID] [--timeout N] [--idle-seconds N] [--queue-timeout N] | 前台提交、保持心跳、打印 UART、等待收尾；submit 为同义命令 |
+| run IMAGE [--name NAME] [--id ID] [--timeout N] [--idle-seconds N] [--queue-timeout N] | 前台提交、保持心跳、打印 UART、等待收尾；submit 为同义命令 |
 | job ID | 查询 |
 | jobs [--state queued,running] [--limit N] [--offset N] | 分页列表 |
 | cancel ID | 请求取消排队或运行任务；cancelling 尚未完成收尾 |
@@ -209,6 +241,7 @@ fpga-scheduler [--endpoint URL] [--token-file PATH] [--json] <command>
 
 默认输出可读文本：daemon status 显示进程、API、活动任务数和端口表；jobs / devices 显示表格，
 job / cancel / wait 显示任务详情，run / submit 实时打印 UART 后显示最终摘要，不重复打印 UART。
+`jobs` 最左侧的 `TASK` 列显示任务名称，无名称的历史任务显示 `-`。
 终端默认按状态着色，表头为青色；管道和重定向默认无颜色，NO_COLOR 环境变量或 TERM=dumb 关闭自动着色。
 --color auto/always/never 可放在命令前或后，显式 always 可强制开启；JSON 始终不加颜色，UART 内容不额外着色。
 --json 可放在子命令前或后，例如 fpga-scheduler jobs --json，保留原始字段供脚本读取；
@@ -223,7 +256,8 @@ Ctrl-C 为 130 并取消该客户端的任务。
 
 保留原有 HTTP 路由和 SDK 方法名称；提交必须升级至租约协议，新增上述会话和增量输出接口。devices 增加 state（READY/BUSY/RECOVERING/QUARANTINED）、
 session 和 downloads；首次初始化可提高 Client(request_timeout=360)。
-Result.details 包含 session、uvhs_pid、fpga、downloads、ddr_readback_matches、reset_confirmed。
+Result.details 包含 session、uvhs_pid、fpga、downloads、ddr_readback_matches、reset_confirmed、
+load_seconds，以及未启用读回校验时的 ddr_readback_skipped。
 应用 exit 0 而收尾失败时 ok=False。取消/超时确认 CPU 复位和 UART 静默后保留 session，不冷却；
 若收尾或控制通道失败，隔离端口，不自动重建。仅适用于现有 NH-only profile，不承诺 DMA/E6 安全。
 CLI 新增 daemon start/status/stop --config <file>。

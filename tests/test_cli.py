@@ -68,14 +68,17 @@ class OutputTests(unittest.TestCase):
     @patch('fpga_scheduler.cli.Client')
     def test_jobs_table_pagination_and_empty_list(self, factory):
         value = dict(total=3, offset=1, limit=2, jobs=[
-            dict(id='a' * 32, state='queued', position=2, waiting_reason='Waiting for an available FPGA'),
-            dict(id='b' * 32, state='failed', node='local', fpga=0,
+            dict(id='a' * 32, name='matrix multiply', state='queued', position=2,
+                 waiting_reason='Waiting for an available FPGA'),
+            dict(id='b' * 32, name='hello.bin', state='failed', node='local', fpga=0,
                  result=dict(seconds=1.25, execution_status='exited', app_exit_code=-2147483648))])
         factory.return_value.jobs.return_value = value
         code, stdout, stderr = self.invoke('jobs', '--offset', '1', '--limit', '2')
         self.assertEqual((code, stderr), (0, ''))
         self.assertIn('3 matching | showing 2 | offset 1', stdout)
-        for expected in ('STATE', 'APP EXIT', 'a' * 32, 'queued', 'local/FPGA0',
+        self.assertEqual(stdout.splitlines()[1].split()[:2], ['TASK', 'ID'])
+        self.assertTrue(stdout.splitlines()[3].startswith('matrix multiply  ' + 'a' * 32))
+        for expected in ('hello.bin', 'STATE', 'APP EXIT', 'a' * 32, 'queued', 'local/FPGA0',
                          '-2147483648', '1.25s', 'Waiting for an available FPGA'):
             self.assertIn(expected, stdout)
         factory.return_value.jobs.assert_called_once_with(('queued', 'running', 'cancelling'), limit=2, offset=1)
@@ -84,6 +87,24 @@ class OutputTests(unittest.TestCase):
         factory.return_value.jobs.return_value = dict(total=0, jobs=[], offset=0)
         _, stdout, _ = self.invoke('jobs')
         self.assertIn('No matching jobs.', stdout)
+
+    def test_task_names_are_visible_and_legacy_jobs_remain_readable(self):
+        named = dict(id='a' * 32, name='Matrix test', state='queued')
+        legacy = dict(id='b' * 32, state='running')
+        table = render('jobs', dict(total=2, jobs=[named, legacy]))
+        self.assertTrue(table.splitlines()[3].startswith('Matrix test  ' + named['id']))
+        self.assertRegex(table.splitlines()[4], r'^-\s+' + legacy['id'])
+        details = render('job', named)
+        self.assertTrue(details.startswith('Task: ' + named['id'] + '\nName: Matrix test\n'))
+        self.assertNotIn('Name:', render('job', legacy))
+
+    def test_jobs_task_names_align_wide_and_combining_characters(self):
+        jobs = [dict(id='a' * 32, name='矩阵乘法', state='running'),
+                dict(id='b' * 32, name='hello.bin', state='queued'),
+                dict(id='c' * 32, name='cafe\u0301.bin', state='queued')]
+        rows = render('jobs', dict(total=3, jobs=jobs)).splitlines()[3:]
+        for row, job, padding in zip(rows, jobs, (3, 2, 3)):
+            self.assertTrue(row.startswith(job['name'] + ' ' * padding + job['id']), row)
 
     @patch('fpga_scheduler.cli.Client')
     def test_devices_show_quarantine_reasons_and_node_errors(self, factory):
@@ -159,10 +180,16 @@ class OutputTests(unittest.TestCase):
         for command in ('run', 'submit'):
             code, stdout, stderr = self.invoke(command, 'hello.bin')
             self.assertEqual(code, 0, stderr)
+            client.submit.assert_called_with('hello.bin', ident=None, name=None, timeout=600,
+                                             idle_seconds=60, queue_timeout=3600)
             self.assertTrue(stdout.startswith('hello\nTask: '), stdout)
             self.assertEqual(stdout.count('hello'), 1)
             self.assertIn('App exit code: 0', stdout)
             self.assertIn('Task ' + task.id, stderr)
+            code, _, stderr = self.invoke(command, 'hello.bin', '--name', '矩阵乘法 benchmark')
+            self.assertEqual(code, 0, stderr)
+            client.submit.assert_called_with('hello.bin', ident=None, name='矩阵乘法 benchmark',
+                                             timeout=600, idle_seconds=60, queue_timeout=3600)
         code, stdout, stderr = self.invoke('run', 'hello.bin', '--json')
         self.assertEqual(code, 0, stderr)
         value = json.loads(stdout)

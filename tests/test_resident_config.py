@@ -91,6 +91,47 @@ uvhs_shell="/vendor/uvhs"
         self.assertEqual(config.nodes[0].ports, (4,))
         self.assertEqual(config.resident['init_scripts'], {4: str(self.root / 'init/init4.tcl')})
 
+    def topology_config(self, mapping, text=None):
+        text = self.base if text is None else text
+        return self.config(text.replace('[resident]\n',
+                                        '[resident]\ntopology_boards=' + mapping + '\n'))
+
+    def test_missing_topology_mapping_preserves_runtime_inventory_mode(self):
+        self.assertNotIn('topology_boards', self.config().resident)
+
+    def test_topology_board_mapping_is_explicit_and_not_a_tb_offset(self):
+        text = self.base.replace('"4"="init/init4.tcl"',
+                                 '"43"="init/init43.tcl"').replace('ports=[4,5]', 'ports=[43,5]')
+        config = self.topology_config('{"10"="TB2", "1"="TB17"}', text)
+        self.assertEqual(config.resident['topology_boards'], {10: 'TB2', 1: 'TB17'})
+        self.assertEqual(config.nodes[0].ports, (43, 5))
+
+    def test_topology_mapping_allows_disabled_boards_but_requires_enabled_boards(self):
+        config = self.topology_config('{"0"="TB7", "1"="TB2"}')
+        self.assertEqual(config.resident['topology_boards'], {0: 'TB7', 1: 'TB2'})
+        text = self.base.replace('"4"="init/init4.tcl"',
+                                 '"43"="init/init43.tcl"').replace('ports=[4,5]', 'ports=[43,5]')
+        with self.assertRaisesRegex(ValueError, r'topology_boards.*missing=\[10\]'):
+            self.topology_config('{"1"="TB2"}', text)
+
+    def test_topology_mapping_rejects_empty_non_table_and_duplicate_physical_boards(self):
+        for mapping in ('{}', '[]', '["TB2"]', 'true', '1', '"TB2"',
+                        '{"0"="TB2", "1"="TB2"}'):
+            with self.subTest(mapping=mapping), self.assertRaisesRegex(ValueError, 'topology_boards'):
+                self.topology_config(mapping)
+
+    def test_topology_mapping_rejects_noncanonical_logical_board_numbers(self):
+        for key in ('01', '-1', '+1', '1.0', '', ' 1', 'B1'):
+            mapping = '{"' + key + '"="TB2", "1"="TB3"}'
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'topology_boards'):
+                self.topology_config(mapping)
+
+    def test_topology_mapping_rejects_invalid_or_dynamic_physical_board_ids(self):
+        for value in ('true', '1', '["TB2"]', '""', '"tb2"', '"TB02"',
+                      '"TB-1"', '"TB2 "', '"$BOARD"', '"TB2; download"'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'topology_boards'):
+                self.topology_config('{"1"=' + value + '}')
+
     def test_missing_enabled_script_reports_port(self):
         text = self.all_scripts().replace('"6"="init/init6.tcl"\n', '')
         with self.assertRaisesRegex(ValueError, r'include every enabled port.*missing=\[6\]'):

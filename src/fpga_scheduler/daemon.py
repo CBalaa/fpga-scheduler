@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import signal
+import select
 import subprocess
 import sys
 import time
@@ -15,6 +16,52 @@ from .client import Client, SchedulerError
 from .config import load
 from .remote.uvhs_session import atomic_json, fingerprint
 from .service import read_token
+
+
+SERVICE_STARTUP_EXIT = 78
+SERVICE_ERROR_BYTES = 8192
+
+
+def _capture_stderr(process, handler):
+    """Continuously drain diagnostics to a rotating log and a bounded tail."""
+    done, tail = threading.Event(), bytearray()
+
+    def capture():
+        after_exit = 65536
+        try:
+            while True:
+                readable = select.select([process.stderr], [], [], .1)[0]
+                if not readable:
+                    if done.is_set():
+                        break
+                    continue
+                chunk = os.read(process.stderr.fileno(), 4096)
+                if not chunk:
+                    break
+                tail.extend(chunk)
+                del tail[:-SERVICE_ERROR_BYTES]
+                handler.emit(logging.LogRecord('service.stderr', logging.ERROR, __file__, 0,
+                                              chunk.decode(errors='replace').rstrip('\n'), (), None))
+                if done.is_set():
+                    # A descendant retaining stderr must not prevent supervisor
+                    # recovery, even if it keeps writing after the service exits.
+                    after_exit -= len(chunk)
+                    if after_exit <= 0:
+                        break
+        finally:
+            process.stderr.close()
+
+    reader = threading.Thread(target=capture, daemon=True)
+    reader.start()
+    return reader, done, tail
+
+
+def _startup_failure(record):
+    error = record.get('startup_error') if record else None
+    if not error:
+        return None
+    return ('Daemon service startup failed: ' + error['message']
+            + '; diagnostics: ' + error['log'])
 
 
 def _paths(config):
@@ -83,6 +130,11 @@ def start(path, timeout=360):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         record = _record(pidfile)
+        if record and record.get('pid') == process.pid:
+            error = _startup_failure(record)
+            if error:
+                threading.Thread(target=process.wait, daemon=True).start()
+                raise RuntimeError(error)
         if record and record.get('pid') == process.pid and _alive(record):
             try:
                 health = _client(config).health()
@@ -94,6 +146,12 @@ def start(path, timeout=360):
             except SchedulerError:
                 pass
         if process.poll() is not None:
+            # The final record may have been published after this iteration's
+            # first read but before the supervisor exited.
+            record = _record(pidfile)
+            error = _startup_failure(record) if record and record.get('pid') == process.pid else None
+            if error:
+                raise RuntimeError(error)
             raise RuntimeError('Supervisor exited during startup; inspect daemon/launcher.log')
         time.sleep(.1)
     # Cancel startup through the supervisor; it drains any accepted work.
@@ -129,9 +187,11 @@ def supervise(path):
         lock.close()
         raise RuntimeError('Supervisor lock already held') from None
     handler = RotatingFileHandler(root / 'supervisor.log', maxBytes=1048576, backupCount=3)
+    diagnostics_path = root / 'service-stderr.log'
+    diagnostics = RotatingFileHandler(diagnostics_path, maxBytes=65536, backupCount=2)
     logging.basicConfig(level=logging.INFO, handlers=[handler], format='%(asctime)s %(message)s')
     record = dict(pid=os.getpid(), start_ticks=fingerprint(os.getpid()), config=str(Path(path).resolve()),
-                  child=None, restarts=0, stopping=False)
+                  child=None, restarts=0, stopping=False, service_started=False)
     atomic_json(pidfile, record)
     stopping = False
     child = None
@@ -150,24 +210,45 @@ def supervise(path):
         delay = 1
         while not stopping:
             started = time.monotonic()
-            # stdout/stderr are deliberately not an unbounded on-disk pipe.
-            # Application installs its own rotating logger; UVHS logs are bounded.
+            # Application logging and CLI constructor failures have separate
+            # bounded logs: constructor errors occur before Application's logger
+            # has a chance to record them.
             child = subprocess.Popen([sys.executable, '-m', 'fpga_scheduler', 'serve', '--config', str(Path(path).resolve())],
                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, start_new_session=True)
+                                     stderr=subprocess.PIPE, start_new_session=True)
+            reader, captured, error_tail = _capture_stderr(child, diagnostics)
             record['child'] = dict(pid=child.pid, start_ticks=fingerprint(child.pid))
             atomic_json(pidfile, record)
             while child.poll() is None:
                 time.sleep(.1)
+            captured.set()
+            reader.join(timeout=2)
             logging.info('Service retired with status %s', child.returncode)
+            error = dict(exit_code=child.returncode,
+                         message=error_tail.decode(errors='replace').strip() or
+                                 f'Service exited with status {child.returncode}',
+                         log=str(diagnostics_path), time=time.time())
+            if child.returncode:
+                record['last_error'] = error
+            startup_failed = child.returncode == SERVICE_STARTUP_EXIT and not record['service_started']
+            if startup_failed:
+                record['startup_error'] = error
+            elif child.returncode != SERVICE_STARTUP_EXIT:
+                # The CLI only reserves 78 for Application construction. Once
+                # construction passed, runtime crashes retain normal recovery.
+                record['service_started'] = True
+            atomic_json(pidfile, record)
             # The foreground process may have left owned UVHS grandchildren.
             # Exact PID/start-time records avoid touching unrelated sessions.
             from .remote.uvhs_session import retire_record
-            records = list((config.state_dir / 'resident/ports').glob('*/session.json'))
+            enabled = {port for node in config.nodes for port in node.ports}
+            records = [config.state_dir / 'resident/ports' / str(port) / 'session.json'
+                       for port in sorted(enabled)]
+            records = [session for session in records if session.exists()]
             records += list((config.state_dir / 'resident/probes').glob('*.json'))
             for session in records:
                 retire_record(session)
-            if stopping:
+            if stopping or startup_failed:
                 break
             record['restarts'] += 1
             atomic_json(pidfile, record)
@@ -182,4 +263,5 @@ def supervise(path):
         atomic_json(pidfile, record)
         for sig, previous in old.items():
             signal.signal(sig, previous)
+        diagnostics.close()
         lock.close()

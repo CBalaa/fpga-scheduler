@@ -17,7 +17,8 @@ from ..models import BUSY_EXIT, BUSY_TOKEN
 from ..remote.init_script import load_init_script
 from ..remote.runner import platform_error
 from ..remote.runtime import parse_fpgas
-from ..remote.uvhs_session import Session, atomic_json, fingerprint, retire_record
+from ..remote.topology import merge_inventory, parse_physical_fpgas, parse_topology
+from ..remote.uvhs_session import Session, atomic_json, fingerprint, group_members, retire_record
 from ..artifacts import validate_artifacts
 from ..storage import StorageQuotaExceeded
 
@@ -30,9 +31,9 @@ class Resident:
     supports_cancellation = True
     background_inventory = True
     def __init__(self, nodes, state_dir, *, hardware_project, lock_dir,
-                 recovery_attempts=3, recovery_backoff=10, max_storage_bytes=1073741824,
+                 recovery_attempts=5, recovery_backoff=10, max_storage_bytes=1073741824,
                  shared_clock_index=6, init_scripts=None, keep_load_files=False,
-                 storage_retry_seconds=10, **options):
+                 storage_retry_seconds=10, topology_boards=None, **options):
         if len(nodes) != 1:
             raise ValueError('Resident backend manages exactly one local node')
         self.nodes, self.node = nodes, nodes[0]
@@ -44,6 +45,15 @@ class Resident:
         if type(shared_clock_index) is not int or not 0 <= shared_clock_index <= 23:
             raise ValueError('shared_clock_index must be an integer in 0..23')
         self.shared_clock_index = shared_clock_index
+        if topology_boards is not None and (
+                not isinstance(topology_boards, dict) or not topology_boards
+                or any(type(board) is not int or board < 0 or not isinstance(target, str)
+                       or not re.fullmatch(r'TB(?:0|[1-9][0-9]*)', target)
+                       for board, target in topology_boards.items())
+                or len(set(topology_boards.values())) != len(topology_boards)
+                or not {p // 4 for p in self.node.ports} <= topology_boards.keys()):
+            raise ValueError('topology_boards must map every enabled board to a distinct physical TB ID')
+        self.topology_boards = dict(topology_boards or {})
         if 'explicit_allocation' in options:
             raise ValueError('resident.explicit_allocation is no longer supported; prepare per-FPGA '
                              'initialization Tcl and configure resident.init_scripts')
@@ -67,11 +77,14 @@ class Resident:
         self.storage_retry_seconds = storage_retry_seconds
         self.guard = threading.RLock()
         self.sessions = {}
-        self.states = {p: dict(state='RECOVERING', attempts=0, next_retry=0, reason='Not initialized') for p in self.node.ports}
+        self.states = {p: dict(state='RECOVERING', attempts=0, next_retry=0, reason='Not initialized',
+                               memory_recoveries=0, memory_recovery_pending=False, retiring_session=False)
+                       for p in self.node.ports}
         self.inputs = {}
         self.storage_reserved = {}
         self.stopped = False
         self.initialization_stopping = threading.Event()
+        self.disabled_dirty = set()
         # No dispatcher exists yet. Retire recorded old executors first, including
         # inherited port locks. Dirty hardware must still pass full initialization.
         for path in (self.root / 'probes').glob('*.json'):
@@ -80,8 +93,26 @@ class Resident:
         for path in (self.root / 'ports').glob('*/session.json'):
             if int(path.parent.name) not in self.node.ports:
                 record = json.loads(path.read_text())
-                if not record.get('closed_cleanly'):
-                    raise RuntimeError('Stop with the previous whitelist before changing ports')
+                if not isinstance(record, dict):
+                    raise RuntimeError('Disabled FPGA session record must be a JSON object: ' + str(path))
+                if record.get('closed_cleanly') is not True:
+                    number = int(path.parent.name)
+                    # Disabling a failed target does not certify its hardware
+                    # clean. Retain its dirty record, but permit other targets
+                    # once exact process retirement is independently verified.
+                    if (record.get('processes_retired') is not True
+                            or type(record.get('number')) is not int or record['number'] != number
+                            or type(record.get('pid')) is not int or record['pid'] <= 0
+                            or not isinstance(record.get('start_ticks'), str)
+                            or not re.fullmatch(r'[1-9][0-9]*', record['start_ticks'])):
+                        raise RuntimeError(f'Disabled FPGA{number} has unverified UVHS retirement; '
+                                           'preserve its session record and inspect the previous executor')
+                    if group_members(record):
+                        raise RuntimeError(f'Disabled FPGA{number} still has a live UVHS process group; '
+                                           'stop its previous executor before changing ports')
+                    self.disabled_dirty.add(number)
+                    LOG.warning('Disabled FPGA%s retains an unclean hardware session; '
+                                'its recorded UVHS process group has retired', number)
             else:
                 retire_record(path)
         # Only reliable terminal records with verified readback and reset allow
@@ -112,22 +143,55 @@ class Resident:
                     retire_record(record)
                     record.unlink()
                 process.wait()
+            if self.topology_boards:
+                self._discovery_log('last-query.log', output)
             if process.returncode or platform_error(output.encode()):
                 raise RuntimeError('UVHS hardware query failed')
         return output
 
     def _physical(self):
-        return parse_fpgas(self._hardware_query('query -fpgas -all'))
+        if not self.topology_boards:
+            return parse_fpgas(self._hardware_query('query -fpgas -all'))
+        # Runtime inventory omits unplugged partitions. Discover real devices
+        # and their complete power/owner/booked status without loading any DB.
+        output = self._hardware_query('topology -query -tb -hw\n'
+                                      'topology -query -fpgas -tb\n'
+                                      'query -fpgas -all -tb\nquery -fpgas -all')
+        self._discovery_log('discovery.log', output)
+        physical = merge_inventory(parse_fpgas(output, allow_empty=True),
+                                   parse_physical_fpgas(output), parse_topology(output),
+                                   self.topology_boards)
+        atomic_json(self.root / 'discovery.json', dict(sampled_at=time.time(),
+                    topology_boards=self.topology_boards, devices=physical))
+        return physical
+
+    def _discovery_log(self, name, output):
+        path = self.root / name
+        temporary = path.with_suffix('.tmp')
+        temporary.write_text(output)
+        temporary.replace(path)
 
     def _clocks(self):
         # With no DB loaded this reports live board clocks, not the database's
         # sign-off defaults. -board can still return every board; filter by ID.
-        output = self._hardware_query('set_option runtime.database.remapping_enable true\nquery -clock')
+        output = self._hardware_query('set_option runtime.database.remapping_enable true\nquery -clock'
+                                      + (' -tb' if self.topology_boards else ''))
+        if self.topology_boards:
+            self._discovery_log('clocks.log', output)
+        board_ids = {value: key for key, value in self.topology_boards.items()}
         clocks = {}
         for line in output.splitlines():
-            match = re.fullmatch(r'\s*B(\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\S+\s+PLL\s*', line)
+            match = re.fullmatch(r'\s*((?:T)?B\d+)\s+(\d+)\s+(\d+(?:\.\d+)?)\s+\S+\s+PLL\s*', line)
             if match:
-                key = int(match[1]), int(match[2])
+                if self.topology_boards:
+                    if match[1] not in board_ids:
+                        continue
+                    board = board_ids[match[1]]
+                else:
+                    if not match[1].startswith('B'):
+                        continue
+                    board = int(match[1][1:])
+                key = board, int(match[2])
                 if key in clocks:
                     raise RuntimeError('UVHS returned a duplicate board clock')
                 clocks[key] = float(match[3]) * 1000000
@@ -137,8 +201,11 @@ class Resident:
         # Re-read for each rebuild; live sessions retain their original snapshot.
         script = load_init_script(self.init_scripts[number], number)
         board = number // 4
-        active = sorted(p for p, info in physical.items() if p != number and p // 4 == board
-                        and (info['owner'] or info['booked'] or p in self.sessions))
+        active = sorted({p for p, info in physical.items() if p != number and p // 4 == board
+                         and (info['owner'] or info['booked'] or p in self.sessions)}
+                        | {p for p in self.disabled_dirty if p // 4 == board})
+        board_owners = sorted({owner for p, info in physical.items() if p // 4 == board
+                               for owner in info.get('board_owners', ())})
         frequency = self._clocks().get((board, self.shared_clock_index))
         if script.configures_clock:
             # Require full occupancy information before running clock commands.
@@ -153,12 +220,16 @@ class Resident:
                            + 'FPGA inventory missing ' + ', '.join(f'FPGA{p}' for p in missing),
                     next_retry=time.monotonic() + self.backoff)
                 return None
-        if (active or not script.configures_clock) and (
+        if (active or board_owners or not script.configures_clock) and (
                 frequency is None or abs(frequency - NH_CLOCK_HZ) > .5):
             actual = 'unknown' if frequency is None else f'{frequency:g} Hz'
-            constraint = (', '.join(f'FPGA{p}' for p in active) + ' active; '
-                          'refusing to change a shared clock' if active else
-                          'initialization Tcl has no clock configuration')
+            if active:
+                constraint = ', '.join(f'FPGA{p}' for p in active) + ' active; refusing to change a shared clock'
+            elif board_owners:
+                constraint = ('board topology reports ' + ', '.join(board_owners)
+                              + '; refusing to change a shared clock')
+            else:
+                constraint = 'initialization Tcl has no clock configuration'
             self.states[number].update(
                 reason=f'Shared B{board}.GCLK{self.shared_clock_index} is {actual}; expected {NH_CLOCK_HZ} Hz; '
                        + constraint,
@@ -203,37 +274,50 @@ class Resident:
             state['reason'] = 'Service is stopping'
             return
         board = number // 4
-        board_lock = self._lock(f'board{board}.lock')
-        if board_lock is None:
-            state['reason'] = 'Board maintenance active'
-            return
+        board_lock = None
         handle = None
+
+        def blocked(reason):
+            # Recovery must not poll forever after a hung command. In particular,
+            # an owner or inherited lock that survived retirement is a failed
+            # recovery attempt, not permission to start a second shell.
+            if state['memory_recovery_pending'] or state['retiring_session']:
+                raise RuntimeError(reason)
+            state.update(reason=reason, next_retry=time.monotonic() + self.backoff)
+
         try:
+            board_lock = self._lock(f'board{board}.lock')
+            if board_lock is None:
+                blocked('Board maintenance active')
+                return
+            if number in self.sessions:
+                # A wedged shell can also block inventory queries. Retire it
+                # first, with the board lock held, then recheck physical owners.
+                state['retiring_session'] = True
+                session = self.sessions[number]
+                session.close()
+                if not session.retired:
+                    raise RuntimeError('Previous UVHS process retirement was not confirmed')
+                del self.sessions[number]
             physical = self._physical()
             # A sibling FPGA is an independent execution slot. Only ownership
             # of this target prevents allocation; shared clocks are checked
             # separately before any initialization commands are submitted.
             info = self._target(physical, number)
-            if (info['owner'] or info['booked']) and number not in self.sessions:
-                state['reason'] = f'FPGA{number} occupied by another session'
+            if info['owner'] or info['booked']:
+                blocked('Previous session ownership has not retired' if state['retiring_session']
+                        else f'FPGA{number} occupied by another session')
                 return
-            if number in self.sessions:
-                self.sessions.pop(number).close()
-                # Confirm unload retired ownership before any full rebuild.
-                physical = self._physical()
-                info = self._target(physical, number)
-                if info['owner'] or info['booked']:
-                    state['reason'] = 'Previous session ownership has not retired'
-                    return
             if info['power'] != 'on':
-                state['reason'] = 'FPGA power off'
+                blocked('FPGA power off')
                 return
             reason = self._uart_busy(number)
             if reason:
-                state['reason'] = reason
+                blocked(reason)
                 return
             bootstrap = self._initialization_script(number, physical)
             if bootstrap is None:
+                blocked(state['reason'])
                 return
             # Inventory/clock queries can take minutes. A graceful stop may
             # have arrived while they ran; do not allocate a new session now.
@@ -242,7 +326,7 @@ class Resident:
                 return
             handle = self._lock(f'fpga{number}.lock')
             if handle is None:
-                state['reason'] = 'Port lock held by another executor'
+                blocked('Port lock held by another executor')
                 return
             directory = self.root / 'ports' / str(number)
             directory.mkdir(parents=True, exist_ok=True)
@@ -266,19 +350,29 @@ class Resident:
             try:
                 session.start(bootstrap)
             except BaseException:
-                session.close()
+                try:
+                    session.close()
+                except Exception:
+                    # Preserve its record, UART and lock until a later attempt
+                    # can confirm retirement; never orphan an unverified shell.
+                    self.sessions[number] = session
+                    raise
                 raise
             self.sessions[number] = session
-            state.update(state='READY', reason='', attempts=0)
+            state.update(state='READY', reason='', attempts=0, memory_recovery_pending=False,
+                         retiring_session=False)
         except Exception as error:
             state['attempts'] += 1
             state.update(state='QUARANTINED' if state['attempts'] >= self.recovery_attempts else 'RECOVERING',
                          reason=f'Initialization failed: {error}',
                          next_retry=time.monotonic() + self.backoff * 2 ** (state['attempts'] - 1))
+            LOG.warning('FPGA%s recovery attempt %s/%s failed: %s', number,
+                        state['attempts'], self.recovery_attempts, error)
         finally:
             if handle:
                 handle.close()
-            board_lock.close()
+            if board_lock:
+                board_lock.close()
 
     def probe(self, node):
         if node != self.node.id:
@@ -336,10 +430,14 @@ class Resident:
         with self.guard:
             if payload['id'] in self.storage_reserved:
                 return
+            # Window reads allocate only the bounded snapshot, not the whole
+            # configured span; prefix reads still snapshot base..highest output.
+            snapshot = (self.options.get('max_output_bytes', 16777216)
+                        if self.options.get('output_ddr_read_mode', 'prefix') == 'window'
+                        else self.options.get('output_ddr_bytes', 4194304))
             reserve = (max(1048576, (image.stat().st_size + 1048575) // 1048576 * 1048576) * 2 +
                        self.options.get('max_job_log_bytes', 1048576) * 13 + 65536 +
-                       self.options.get('output_ddr_bytes', 4194304) +
-                       self.options.get('max_output_bytes', 16777216))
+                       snapshot + self.options.get('max_output_bytes', 16777216))
             # Raw UART plus the two JSON-escaped output copies in result.json
             # can require 13 times the UART limit, plus bounded metadata.
             self._check_storage(reserve)
@@ -387,7 +485,24 @@ class Resident:
             self.release_prepared(payload['id'])
             if healthy:
                 self.states[port].update(state='READY', reason='')
+                if result['execution_status'] == 'exited' and result.get('app_exit_code') == 0:
+                    self.states[port]['memory_recoveries'] = 0
             else:
+                memory_timeout = result['details'].get('memory_ack_timeout')
+                if memory_timeout in ('writemem', 'readmem'):
+                    state = self.states[port]
+                    state['memory_recoveries'] += 1
+                    exhausted = state['memory_recoveries'] > self.recovery_attempts
+                    reason = (f'{memory_timeout} acknowledgement timed out; '
+                              + ('UVHS recovery budget exhausted' if exhausted else
+                                 'retiring UVHS shell before full reinitialization'))
+                    state.update(state='QUARANTINED' if exhausted else 'RECOVERING', reason=reason,
+                                 attempts=0, memory_recovery_pending=True,
+                                 next_retry=time.monotonic() + self.backoff * 2 ** (state['memory_recoveries'] - 1))
+                    LOG.warning('FPGA%s task %s session %s: %s (%s/%s recoveries)', port,
+                                payload['id'], session.epoch, reason,
+                                state['memory_recoveries'], self.recovery_attempts)
+                    return result
                 aborted = (result['execution_status'] in ('timeout', 'cancelled') or
                            result['details'].get('interrupted_status') in ('timeout', 'cancelled'))
                 if aborted:
@@ -441,8 +556,11 @@ class Resident:
 
     def _prune_job_load_files(self, directory, result):
         details = result.get('details') or {}
-        if (self.keep_load_files or not isinstance(details, dict) or details.get('reset_confirmed') is not True
-                or details.get('ddr_readback_matches') is not True):
+        if (self.keep_load_files or not isinstance(details, dict)
+                or details.get('reset_confirmed') is not True):
+            return
+        if (details.get('ddr_readback_matches') is not True
+                and details.get('ddr_readback_skipped') is not True):
             return
         paths = [directory / name for name in ('image.bin', 'readback.bin')]
         if not any(path.exists() or path.is_symlink() for path in paths):
@@ -506,6 +624,14 @@ class Resident:
         self.stop_initialization()
         with self.guard:
             self.stopped = True
-            for session in self.sessions.values():
-                session.close()
-            self.sessions.clear()
+            errors = []
+            for number, session in list(self.sessions.items()):
+                try:
+                    session.close()
+                except Exception as error:
+                    errors.append(error)
+                    LOG.exception('Could not close FPGA%s UVHS session', number)
+                else:
+                    del self.sessions[number]
+            if errors:
+                raise RuntimeError('Could not close every UVHS session: ' + str(errors[0])) from errors[0]

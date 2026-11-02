@@ -160,6 +160,14 @@ class JobQueue:
             self.db.execute('UPDATE client_sessions SET heartbeat=? WHERE id=?', (time.time(), ident))
         return dict(id=ident, state='active')
 
+    def touch_session(self, ident):
+        """Validate an active session and refresh its lease for an upload request.
+
+        Long chunked uploads call this per request so a slow transfer keeps the
+        submitting client's lease alive even if its heartbeat request is delayed.
+        """
+        return self.heartbeat(ident)
+
     def close_session(self, ident):
         task_id(ident)
         with self.lock, self.db:
@@ -209,6 +217,9 @@ class JobQueue:
 
     def submit(self, payload, session_id=None):
         payload = validate(payload)
+        maximum = getattr(self.backend, 'max_timeout', None)
+        if maximum is not None and payload['timeout'] > maximum:
+            raise ValueError(f'timeout must be between 1 and {maximum} for this backend')
         with self.lock, self.db:
             if self.stopping.is_set():
                 raise RuntimeError('Service is stopping')
@@ -217,7 +228,7 @@ class JobQueue:
                 self._require_session_locked(session_id)
             previous = self.db.execute('SELECT payload,session_id FROM jobs WHERE id=?', (payload['id'],)).fetchone()
             if previous:
-                if json.loads(previous['payload']) != payload or previous['session_id'] != session_id:
+                if validate(json.loads(previous['payload'])) != payload or previous['session_id'] != session_id:
                     raise Conflict('Task ID already belongs to different inputs')
             else:
                 count = self.db.execute("SELECT count(*) FROM jobs WHERE state IN ('queued','running','cancelling')").fetchone()[0]
@@ -237,6 +248,7 @@ class JobQueue:
             if row is None:
                 raise KeyError(ident)
             data = {key: row[key] for key in ('id', 'state', 'created', 'started', 'finished', 'node', 'fpga', 'error')}
+            data['name'] = json.loads(row['payload']).get('name')
             if row['result']:
                 data['result'] = json.loads(row['result'])
             if row['error_details']:

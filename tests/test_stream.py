@@ -72,13 +72,14 @@ class StreamTests(unittest.TestCase):
                     execution_status='exited', app_exit_code=7 if self.exit_code else 0)
 
     def test_default_returns_stream_before_finish_and_final_result(self):
-        stream = self.client.run_test(self.image, poll_interval=.01)
+        stream = self.client.run_test(self.image, poll_interval=.01, name='streaming benchmark')
         self.assertIsInstance(stream, OutputStream)
         self.assertIsNone(stream.result)
         self.assertTrue(self.wrote.wait(2))
         first = next(stream)
         self.assertEqual(first, 'first: ')
         self.assertEqual(self.client.job(stream.id).state, 'running')
+        self.assertEqual(self.client.job(stream.id).name, 'streaming benchmark')
         self.assertIsNone(stream.result)
         self.release.set()
         self.assertEqual(first + ''.join(stream), self.final_text)
@@ -217,6 +218,13 @@ class StreamTests(unittest.TestCase):
             result = self.client.run_test(self.image, stream=False)
         self.assertTrue(result.ok)
         self.assertIn('legacy text', output.getvalue())
+
+    def test_run_test_stream_grace_covers_the_daemon_loading_phase(self):
+        with patch('fpga_scheduler.client.OutputStream') as output_stream:
+            self.client.run_test(self.image, timeout=7, queue_timeout=11)
+        output_stream.assert_called_once()
+        # queue wait + execution deadline + daemon-side load/DDR grace.
+        self.assertEqual(output_stream.call_args.kwargs['timeout'], 11 + 7 + 1800)
 
     def test_explicit_synchronous_silent_mode_returns_result(self):
         self.release.set()

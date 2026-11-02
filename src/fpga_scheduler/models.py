@@ -2,7 +2,14 @@
 import re
 import threading
 
+# Legacy single-shot limit and the default for a deployment's max_image_bytes.
 MAX_IMAGE = 16 * 1024 * 1024
+# Largest request body accepted by one chunked-upload call.
+MAX_IMAGE_CHUNK = 8 * 1024 * 1024
+# Absolute protocol ceiling for a configured deployment image limit (4 GiB).
+MAX_IMAGE_LIMIT = 4 * 1024 * 1024 * 1024
+# Execution deadline ceiling; the DDR load phase has its own daemon-side limit.
+MAX_TIMEOUT = 86400
 STATES = ('queued', 'running', 'cancelling', 'completed', 'failed', 'cancelled')
 ACTIVE = ('queued', 'running', 'cancelling')
 BUSY_EXIT = 75
@@ -62,14 +69,20 @@ def task_id(value):
 
 
 def validate(payload):
-    if not isinstance(payload, dict) or set(payload) - {'id', 'sha256', 'timeout', 'idle_seconds', 'queue_timeout'}:
+    if not isinstance(payload, dict) or set(payload) - {'id', 'sha256', 'name', 'timeout', 'idle_seconds', 'queue_timeout'}:
         raise ValueError('Invalid task fields')
     task_id(payload.get('id'))
     digest = payload.get('sha256')
     if not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None:
         raise ValueError('Invalid SHA256 digest')
     result = dict(payload)
-    for key, default, maximum in (('timeout', 600, 600), ('idle_seconds', 60, 120), ('queue_timeout', 3600, 86400)):
+    name = result.setdefault('name', None)
+    if name is not None:
+        if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 255
+                or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in name)):
+            raise ValueError('name must be 1..255 characters without control characters')
+        result['name'] = name.strip()
+    for key, default, maximum in (('timeout', 600, MAX_TIMEOUT), ('idle_seconds', 60, 120), ('queue_timeout', 3600, 86400)):
         value = result.setdefault(key, default)
         if type(value) is not int or not 1 <= value <= maximum:
             raise ValueError(f'{key} must be an integer between 1 and {maximum}')

@@ -102,6 +102,24 @@ class QueueTests(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.images.put(task['id'], b'changed')
 
+    def test_task_names_persist_and_legacy_payload_retries_remain_idempotent(self):
+        named = self.submit(1, name='矩阵乘法 benchmark')
+        unnamed = self.submit(2)
+        legacy = dict(id=unnamed['id'], sha256=hashlib.sha256(b'hello').hexdigest(),
+                      timeout=600, idle_seconds=60, queue_timeout=3600)
+        with self.q.db:
+            self.q.db.execute('UPDATE jobs SET payload=? WHERE id=?',
+                              (json.dumps(legacy), unnamed['id']))
+        self.q.close()
+        self.q = JobQueue(self.root / 'jobs.db', self.backend, self.images)
+        self.assertEqual(self.q.get(named['id'])['name'], '矩阵乘法 benchmark')
+        self.assertEqual(self.q.list()['jobs'][0]['name'], '矩阵乘法 benchmark')
+        self.assertIsNone(self.q.submit(legacy)['name'])
+        payload = dict(legacy, id=named['id'], name='矩阵乘法 benchmark')
+        self.assertEqual(self.q.submit(payload)['id'], named['id'])
+        with self.assertRaises(Conflict):
+            self.q.submit(dict(payload, name='different benchmark'))
+
     def test_cancel_queued_and_running(self):
         self.submit(1)
         self.q.cancel(f'{1:032x}')
@@ -111,6 +129,15 @@ class QueueTests(unittest.TestCase):
         self.q.cancel(f'{2:032x}')
         self.finish()
         self.assertEqual(self.q.get(f'{2:032x}')['state'], 'cancelled')
+
+    def test_backend_timeout_capability_is_enforced_before_queueing(self):
+        self.assertIsNone(getattr(self.backend, 'max_timeout', None))
+        self.submit(1, timeout=601)
+        self.backend.max_timeout = 600
+        with self.assertRaises(ValueError) as caught:
+            self.submit(2, timeout=601)
+        self.assertIn('600', str(caught.exception))
+        self.assertEqual(self.submit(3, timeout=600)['state'], 'queued')
 
     def test_capacity_excludes_terminal_tasks(self):
         self.q.capacity = 2
@@ -315,15 +342,26 @@ class QueueTests(unittest.TestCase):
 
 
 class InputTests(unittest.TestCase):
+    def test_task_name_validation(self):
+        payload = dict(id='a' * 32, sha256='b' * 64)
+        self.assertIsNone(validate(payload)['name'])
+        self.assertEqual(validate(dict(payload, name='  矩阵乘法 test  '))['name'], '矩阵乘法 test')
+        self.assertEqual(validate(dict(payload, name='x' * 255))['name'], 'x' * 255)
+        for name in (True, 1, [], '', '   ', 'x' * 256, 'line\nbreak', 'tab\tname',
+                     '\033[31mred', 'null\0name', 'delete\x7fname', 'next\x85line'):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                validate(dict(payload, name=name))
+
     def test_validation_rejects_shell_paths_booleans_and_bounds(self):
         payload = dict(id='a' * 32, sha256='b' * 64)
         for invalid in (None, [], dict(payload, id='../x'), dict(payload, command='ls'),
-                        dict(payload, timeout=True), dict(payload, timeout=601),
+                        dict(payload, timeout=True), dict(payload, timeout=86401),
                         dict(payload, idle_seconds=0), dict(payload, queue_timeout=86401),
                         dict(payload, sha256='x' * 64)):
             with self.assertRaises(ValueError):
                 validate(invalid)
         self.assertEqual(validate(payload)['timeout'], 600)
+        self.assertEqual(validate(dict(payload, timeout=86400))['timeout'], 86400)
 
     def test_upload_validation_hash_and_persistence(self):
         with tempfile.TemporaryDirectory() as root:

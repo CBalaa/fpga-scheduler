@@ -20,7 +20,11 @@ START = b'@@FPGA_START '
 RESULT = b'@@FPGA_RESULT '
 OUTPUT = b'@@FPGA_OUTPUT '
 MAX_OUTPUTS = 16
-MAX_OUTPUT_BYTES = 16 * 1024 * 1024
+# Absolute protocol ceiling for one output declaration, one shape dimension and the
+# per-task total of declared/extracted artifact bytes (256 MiB). A deployment may
+# expose less: resident.max_output_bytes is the per-deployment cap enforced by
+# uvhs_session.capture_outputs.  See contract C3 in build/llm-enablement/design.md.
+MAX_OUTPUT_BYTES = 256 * 1024 * 1024
 OUTPUT_DTYPES = {'|i1': 1, '|u1': 1, '<i2': 2, '<u2': 2, '<i4': 4,
                  '<u4': 4, '<i8': 8, '<u8': 8, '<f4': 4, '<f8': 8}
 

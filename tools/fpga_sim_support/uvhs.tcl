@@ -23,11 +23,44 @@ proc download {} {
     global work
     set f [open [file join $work downloads] a]; puts $f download; close $f
 }
+proc topology {args} {
+    puts "Topology Data"
+    puts [string repeat - 201]
+    if {[lsearch $args -fpgas] >= 0} {
+        set row_format "%-17s%-22s%-22s%-18s%-17s%-17s%s"
+        puts [format $row_format "System Name" "Topology Board ID" "Topology Fpga Id" "Mapped Board ID" "Device Type" "Used by Host" "Used by User"]
+        puts [string repeat - 129]
+        for {set p 0} {$p < 8} {incr p} {
+            puts [format $row_format uvhs-0 "TB[expr {$p / 4 + 1}]" "F[expr {$p % 4}]" "" V1 "" ""]
+        }
+    } else {
+        set row_format "%-17s%-22s%-17s%-35s%-27s%-18s%-17s%-17s%s"
+        puts [format $row_format "System Name" "Topology Board ID" "Device Type" "HW ID CODE" "HW Location" "Mapped Board ID" "Used by Host" "Used by User" Duration]
+        puts [string repeat - 201]
+        for {set board 0} {$board < 2} {incr board} {
+            puts [format $row_format uvhs-0 "TB[expr {$board + 1}]" V1 "SIMULATED-BOARD-$board" "" "B$board" "" "" "0s"]
+        }
+    }
+    puts ""
+}
 proc query {args} {
     global reset_value
     switch -- [lindex $args 0] {
-        -fpgas {for {set p 0} {$p < 8} {incr p} {puts "uvhs-0 B[expr {$p / 4}] F[expr {$p % 4}] on link down false"}}
-        -clock {puts "B0 6 5.529600 NA PLL"; puts "B1 6 5.529600 NA PLL"}
+        -fpgas {
+            set topology [expr {[lsearch $args -tb] >= 0}]
+            puts "Installed DUT FPGA Status:"
+            puts "System Name      Board   FPGA    Power   Status                Owner                 Booked"
+            puts [string repeat - 97]
+            for {set p 0} {$p < 8} {incr p} {
+                if {$topology} {set board "TB[expr {$p / 4 + 1}]"} else {set board "B[expr {$p / 4}]"}
+                puts "uvhs-0 $board F[expr {$p % 4}] on link down false"
+            }
+        }
+        -clock {
+            if {[lsearch $args -tb] >= 0} {
+                puts "TB1 6 5.529600 NA PLL"; puts "TB2 6 5.529600 NA PLL"
+            } else {puts "B0 6 5.529600 NA PLL"; puts "B1 6 5.529600 NA PLL"}
+        }
         -reset {puts "cpu_reset $reset_value"}
     }
 }
@@ -56,10 +89,13 @@ proc readmem {args} {
     set target [lindex $args [expr {[lsearch $args -file] + 1}]]
     if {$released} {
         set rtl [lindex $args [expr {[lsearch $args -rtl] + 1}]]
-        if {![regexp {\[(\d+):0\]} $rtl unused last]} {error "invalid memory range"}
+        # Support both i_ddr[hi:0] (prefix readback) and i_ddr[hi:lo] (window read).
+        if {![regexp {\[(\d+):(\d+)\]} $rtl unused high low]} {error "invalid memory range"}
         set memory [file join [file dirname $loaded] sim-ddr.bin]
-        set f [open $memory rb]; set data [read $f [expr {($last+1)*64}]]; close $f
-        set f [open $target wb]; puts -nonewline $f $data; close $f
+        set f [open $memory rb]; set data [read $f [expr {($high+1)*64}]]; close $f
+        set f [open $target wb]
+        puts -nonewline $f [string range $data [expr {$low*64}] end]
+        close $f
         return
     }
     if {$sim_mode eq "readback-error"} {

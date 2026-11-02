@@ -23,7 +23,7 @@ BUSY_EXIT = 75
 BUSY_TOKEN = '[scheduler] RETRY_BEFORE_LOAD'
 
 
-def parse_fpgas(output):
+def parse_fpgas(output, *, allow_empty=False):
     """Return the devices UVHS actually reports, preserving physical IDs.
 
     A host need not expose both boards (or all four DUTs on a board). Missing
@@ -47,7 +47,7 @@ def parse_fpgas(output):
         owner = fields[6] if len(fields) == 8 else ''
         ports[number] = dict(number=number, board=f'B{number // 4}', fpga=fields[2],
                              owner=owner, power=fields[3], booked=fields[-1] != 'false')
-    if not ports:
+    if not ports and not allow_empty:
         raise RuntimeError('UVHS did not return any FPGA units')
     return ports
 

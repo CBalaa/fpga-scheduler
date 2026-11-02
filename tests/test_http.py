@@ -15,6 +15,7 @@ from urllib.error import HTTPError
 
 from fpga_scheduler.client import Client, SchedulerError
 from fpga_scheduler.config import Config, Node
+from fpga_scheduler.models import MAX_IMAGE
 from fpga_scheduler.service import Application, StateLock, read_token
 from fpga_scheduler.storage import StorageQuotaExceeded
 
@@ -55,16 +56,20 @@ class HTTPTests(unittest.TestCase):
         return subprocess.run([sys.executable, '-m', 'fpga_scheduler', *flags, '--endpoint', self.endpoint,
                                '--token-file', str(self.token), *args], capture_output=True, text=True, env=env)
 
-    def request(self, route, method='GET', body=None, token=TOKEN):
-        request = Request(self.endpoint + route, data=body, method=method,
-                          headers={'Authorization': 'Bearer ' + token})
+    def request(self, route, method='GET', body=None, token=TOKEN, session=None):
+        headers = {'Authorization': 'Bearer ' + token}
+        if session is not None:
+            headers['X-FPGA-Session'] = session
+        request = Request(self.endpoint + route, data=body, method=method, headers=headers)
         return self.opener.open(request, timeout=3)
 
     def test_sdk_round_trip_and_devices(self):
         task = self.client.submit(self.image)
         self.assertEqual(len(task.id), 32)
+        self.assertEqual(task.name, 'image.bin')
         done = self.client.wait(task.id, poll_interval=.01, timeout=3)
         self.assertEqual(done.state, 'completed')
+        self.assertEqual(done.name, 'image.bin')
         self.assertTrue(done.result.ok)
         self.assertEqual(done.result.execution_status, 'exited')
         self.assertEqual(done.result.app_exit_code, 0)
@@ -73,9 +78,21 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(len(self.client.devices()['devices']), 2)
         self.assertTrue(self.client.health()['dispatcher_alive'])
 
+    def test_custom_and_empty_task_names_round_trip(self):
+        self.app.queue.backend.busy.update(('a', 'b'))
+        for name, expected in (('  矩阵乘法 benchmark  ', '矩阵乘法 benchmark'),
+                               ('', 'image.bin'), ('   ', 'image.bin')):
+            with self.subTest(name=name):
+                task = self.client.submit(self.image, name=name)
+                self.assertEqual(task.name, expected)
+                self.assertEqual(self.client.job(task.id).name, expected)
+                listed = next(job for job in self.client.jobs()['jobs'] if job['id'] == task.id)
+                self.assertEqual(listed['name'], expected)
+
     def test_cli_submit_wait_list_and_health(self):
         submitted = self.cli('submit', str(self.image))
         self.assertEqual(submitted.returncode, 0, submitted.stderr)
+        self.assertEqual(json.loads(submitted.stdout)['name'], 'image.bin')
         ident = json.loads(submitted.stdout)['id']
         waited = self.cli('wait', ident, '--poll-interval', '.01', '--timeout', '3')
         self.assertEqual(waited.returncode, 0, waited.stderr)
@@ -87,9 +104,10 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(health.stdout)['hardware_checked'], False)
         devices = self.cli('devices')
         self.assertEqual(len(json.loads(devices.stdout)['devices']), 2)
-        run = self.cli('run', str(self.image))
+        run = self.cli('run', str(self.image), '--name', '命名任务')
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(json.loads(run.stdout)['state'], 'completed')
+        self.assertEqual(json.loads(run.stdout)['name'], '命名任务')
 
     def test_cli_readable_output_over_real_http(self):
         run = self.cli('run', str(self.image), json_output=False)
@@ -99,7 +117,7 @@ class HTTPTests(unittest.TestCase):
         self.assertIn('State: completed', run.stdout)
         self.assertIn('App exit code: 0', run.stdout)
         ident = self.client.jobs(('completed',))['jobs'][0]['id']
-        for args, expected in ((('jobs', '--state', 'completed'), ('STATE', ident, 'completed')),
+        for args, expected in ((('jobs', '--state', 'completed'), ('TASK', 'image.bin', 'STATE', ident, 'completed')),
                                (('job', ident), ('State: completed', 'UART:', 'SIMULATED')),
                                (('devices',), ('AVAILABLE', 'NODE')),
                                (('health',), ('API: OK', 'Dispatcher: running'))):
@@ -254,6 +272,83 @@ class HTTPTests(unittest.TestCase):
                 self.request(route, 'POST', b'{}')
             self.assertEqual(caught.exception.code, 404)
 
+    def test_chunked_image_protocol_legacy_put_and_session_refresh(self):
+        session = 'c' * 32
+        self.assertEqual(json.load(self.request('/sessions/' + session, 'PUT', b'{}'))['id'], session)
+        ident = 'e' * 32
+        status = json.load(self.request('/jobs/' + ident + '/image'))
+        self.assertEqual(status, dict(id=ident, uploaded_bytes=0,
+                                      max_image_bytes=MAX_IMAGE, complete=False))
+        value = json.load(self.request('/jobs/' + ident + '/image?offset=0', 'PUT', b'hello ',
+                                       session=session))
+        self.assertEqual(value, dict(id=ident, offset=0, next_offset=6))
+        # A retry below the stored offset appends only the missing suffix.
+        value = json.load(self.request('/jobs/' + ident + '/image?offset=3', 'PUT', b'lo world',
+                                       session=session))
+        self.assertEqual(value, dict(id=ident, offset=3, next_offset=11))
+        for offset, body in ((3, b'XXXXXXXX'), (99, b'x')):
+            with self.subTest(offset=offset), self.assertRaises(HTTPError) as caught:
+                self.request('/jobs/' + ident + '/image?offset=' + str(offset), 'PUT', body)
+            self.assertEqual(caught.exception.code, 409)
+        for route, method, body, expected in (
+                ('/jobs/' + ident + '/image?offset=-1', 'PUT', b'x', 400),
+                ('/jobs/' + ident + '/image?offset=bad', 'PUT', b'x', 400),
+                ('/jobs/' + ident + '/image?offset=0&offset=1', 'PUT', b'x', 400),
+                ('/jobs/' + ident + '/image?offset=', 'PUT', b'x', 400),
+                ('/jobs/' + ident + '/image?bad=1', 'PUT', b'x', 400),
+                ('/jobs/' + ident + '/image?x=1', 'GET', None, 400)):
+            with self.subTest(route=route), self.assertRaises(HTTPError) as caught:
+                self.request(route, method, body)
+            self.assertEqual(caught.exception.code, expected)
+        self.assertEqual(json.load(self.request('/jobs/' + ident + '/image')),
+                         dict(id=ident, uploaded_bytes=11, max_image_bytes=MAX_IMAGE,
+                              complete=False))
+        digest = hashlib.sha256(b'hello world!').hexdigest()
+        value = json.load(self.request('/jobs/' + ident + '/image?offset=11', 'PUT', b'!',
+                                       session=session))
+        self.assertEqual(value, dict(id=ident, offset=11, next_offset=12))
+        self.assertEqual(json.load(self.request('/jobs/' + ident + '/image'))['uploaded_bytes'], 12)
+        # A legacy single-shot PUT must not override a staged chunked upload.
+        with self.assertRaises(HTTPError) as caught:
+            self.request('/jobs/' + ident + '/image', 'PUT', b'legacy override')
+        self.assertEqual(caught.exception.code, 409)
+        task = json.load(self.request('/jobs', 'POST',
+                                      json.dumps(dict(id=ident, sha256=digest)).encode(),
+                                      session=session))
+        self.assertEqual(task['id'], ident)
+        done = self.client.wait(ident, timeout=5, poll_interval=.01)
+        self.assertEqual(done.state, 'completed')
+        self.assertTrue(done.result.ok)
+        self.assertEqual(json.load(self.request('/jobs/' + ident + '/image')),
+                         dict(id=ident, uploaded_bytes=12, max_image_bytes=MAX_IMAGE,
+                              complete=True))
+        with self.assertRaises(HTTPError) as caught:
+            self.request('/jobs/' + ident + '/image?offset=0', 'PUT', b'xx')
+        self.assertEqual(caught.exception.code, 409)
+        # Legacy raw PUT + POST remain compatible with old SDK clients.
+        legacy = 'f' * 32
+        digest = hashlib.sha256(b'legacy image').hexdigest()
+        value = json.load(self.request('/jobs/' + legacy + '/image', 'PUT', b'legacy image'))
+        self.assertEqual(value, dict(id=legacy, sha256=digest))
+        task = json.load(self.request('/jobs', 'POST',
+                                      json.dumps(dict(id=legacy, sha256=digest)).encode(),
+                                      session=session))
+        self.assertEqual(task['id'], legacy)
+        self.assertEqual(self.client.wait(legacy, timeout=5, poll_interval=.01).state, 'completed')
+        # An expired session is rejected on image routes, including status GET.
+        short = 'd' * 32
+        self.request('/sessions/' + short, 'PUT',
+                     json.dumps(dict(heartbeat_seconds=.02, lease_seconds=.05)).encode())
+        time.sleep(.15)
+        for route, method, body in (('/jobs/' + '9' * 32 + '/image?offset=0', 'PUT', b'x'),
+                                    ('/jobs/' + '9' * 32 + '/image', 'GET', None)):
+            with self.subTest(route=route), self.assertRaises(HTTPError) as caught:
+                self.request(route, method, body, session=short)
+            self.assertEqual(caught.exception.code, 409)
+        with self.assertRaises(HTTPError) as caught:
+            self.request('/jobs/' + '9' * 32 + '/image', session='not-a-session')
+        self.assertEqual(caught.exception.code, 409)
+
     def test_bad_json_payload_size_hash_and_filters(self):
         for route, method, body, status in (
             ('/jobs', 'POST', b'not JSON', 409),
@@ -273,7 +368,8 @@ class HTTPTests(unittest.TestCase):
 
     def test_client_validation_before_upload(self):
         with patch.object(self.client, '_request') as request:
-            for change in ({'timeout': True}, {'idle_seconds': 0}, {'queue_timeout': 86401}):
+            for change in ({'timeout': True}, {'idle_seconds': 0}, {'queue_timeout': 86401},
+                           {'name': True}, {'name': 'x' * 256}, {'name': 'bad\nname'}):
                 with self.assertRaises(ValueError):
                     self.client.submit(self.image, **change)
             request.assert_not_called()

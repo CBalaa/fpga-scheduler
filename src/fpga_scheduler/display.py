@@ -2,6 +2,7 @@
 import os
 import sys
 import time
+import unicodedata
 
 
 def color_enabled(mode='auto', stream=None):
@@ -40,12 +41,18 @@ def _text(value):
     return ' '.join(str(value).split())
 
 
+def _width(text):
+    return sum(0 if unicodedata.category(char) in ('Mn', 'Me', 'Cf') else
+               2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+               for char in text)
+
+
 def _table(headers, rows, *, color=False, tones=None):
     rows = [[_text(value) for value in row] for row in rows]
-    widths = [max([len(header), *(len(row[i]) for row in rows)]) for i, header in enumerate(headers)]
+    widths = [max([_width(header), *(_width(row[i]) for row in rows)]) for i, header in enumerate(headers)]
 
     def line(row, row_tones):
-        cells = [paint(value, tone, color=color) + ' ' * (width - len(value))
+        cells = [paint(value, tone, color=color) + ' ' * (width - _width(value))
                  for value, width, tone in zip(row, widths, row_tones)]
         return '  '.join(cells).rstrip()
 
@@ -107,11 +114,11 @@ def jobs(data, *, color=False):
     rows, tones = [], []
     for task in tasks:
         result = task.get('result') or {}
-        rows.append([task['id'], task['state'], _target(task), task.get('position'),
+        rows.append([task.get('name'), task['id'], task['state'], _target(task), task.get('position'),
                      _duration(task), result.get('execution_status'), result.get('app_exit_code')])
-        tones.append([None, _state_tone(task['state']), None, None, None,
+        tones.append([None, None, _state_tone(task['state']), None, None, None,
                       _state_tone(task['state']), _exit_tone(result.get('app_exit_code'))])
-    lines.append(_table(['ID', 'STATE', 'TARGET', 'QUEUE', 'TIME', 'RESULT', 'APP EXIT'],
+    lines.append(_table(['TASK', 'ID', 'STATE', 'TARGET', 'QUEUE', 'TIME', 'RESULT', 'APP EXIT'],
                         rows, color=color, tones=tones))
     for task in tasks:
         reason = task.get('error') or task.get('waiting_reason')
@@ -208,8 +215,11 @@ def daemon(action, data, *, color=False):
 
 
 def task(data, *, include_output=True, color=False):
-    lines = [f'Task: {data["id"]}', 'State: ' + paint(data['state'], _state_tone(data['state']), color=color),
-             f'Target: {_target(data)}']
+    lines = [f'Task: {data["id"]}']
+    if data.get('name'):
+        lines.append('Name: ' + _text(data['name']))
+    lines.extend(['State: ' + paint(data['state'], _state_tone(data['state']), color=color),
+                  f'Target: {_target(data)}'])
     for key in ('created', 'started', 'finished'):
         if data.get(key) is not None:
             lines.append(f'{key.title()}: {_timestamp(data[key])}')

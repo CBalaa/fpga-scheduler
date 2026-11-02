@@ -5,6 +5,8 @@ from pathlib import Path, PurePosixPath
 import re
 import tomllib
 
+from .models import MAX_IMAGE, MAX_IMAGE_LIMIT
+
 
 def positive(value, name, minimum=0, inclusive=False):
     if (isinstance(value, bool) or not isinstance(value, (int, float))
@@ -39,6 +41,8 @@ class Config:
     cooldown_seconds: float = 60
     retention_days: float = 7
     transfer_timeout: float = 120
+    max_image_bytes: int = MAX_IMAGE
+    upload_timeout: float = 120
     client_heartbeat_seconds: float = 2
     client_lease_seconds: float = 15
     simulator: dict = field(default_factory=dict)
@@ -107,6 +111,14 @@ def load(path):
     for name, default in (('client_heartbeat_seconds', 2), ('client_lease_seconds', 15)):
         if not .01 <= data.get(name, default) <= 3600:
             raise ValueError(f'{name} must be within 0.01..3600')
+    if 'max_image_bytes' in data:
+        maximum = data['max_image_bytes']
+        if type(maximum) is not int or not 1 <= maximum <= MAX_IMAGE_LIMIT:
+            raise ValueError(f'max_image_bytes must be an integer within 1..{MAX_IMAGE_LIMIT}')
+    if 'upload_timeout' in data:
+        positive(data['upload_timeout'], 'upload_timeout')
+        if data['upload_timeout'] > 3600:
+            raise ValueError('upload_timeout must be at most 3600 seconds')
     if 'cooldown_seconds' in data:
         positive(data['cooldown_seconds'], 'cooldown_seconds', inclusive=True)
     for name, maximum in (('port', 65535), ('queue_capacity', 100000)):
@@ -133,11 +145,12 @@ def load(path):
     if not isinstance(data.get('resident', {}), dict):
         raise ValueError('resident must be a table')
     resident = dict(data.get('resident', {}))
-    fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout',
+    fields = {'hardware_project', 'lock_dir', 'startup_timeout', 'command_timeout', 'load_timeout',
               'uart_quiet_seconds', 'recovery_attempts', 'recovery_backoff',
               'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes', 'profile', 'shared_clock_index',
-              'output_ddr_base', 'output_ddr_bytes', 'max_output_bytes', 'explicit_allocation', 'init_scripts',
-              'keep_load_files', 'storage_retry_seconds'}
+              'output_ddr_base', 'output_ddr_bytes', 'output_ddr_read_mode', 'verify_readback',
+              'max_output_bytes', 'explicit_allocation', 'init_scripts',
+              'keep_load_files', 'storage_retry_seconds', 'topology_boards'}
     if set(resident) - fields:
         raise ValueError('Unknown resident options')
     if backend == 'bosc-resident':
@@ -154,6 +167,20 @@ def load(path):
             if not isinstance(resident[name], str) or not resident[name] or any(c in resident[name] for c in ('\x00', '\n', '\r')):
                 raise ValueError(f'Invalid resident {name}')
             resident[name] = str((path.parent / resident[name]).resolve())
+    if 'topology_boards' in resident:
+        mapping = resident['topology_boards']
+        if (not isinstance(mapping, dict) or not mapping
+                or any(not isinstance(key, str) or not re.fullmatch(r'0|[1-9][0-9]*', key)
+                       or not isinstance(value, str) or not re.fullmatch(r'TB(?:0|[1-9][0-9]*)', value)
+                       for key, value in mapping.items())
+                or len(set(mapping.values())) != len(mapping)):
+            raise ValueError('resident.topology_boards must map quoted nonnegative board numbers '
+                             'to distinct physical topology board IDs, e.g. {"0" = "TB1"}')
+        resident['topology_boards'] = {int(key): value for key, value in mapping.items()}
+        if backend == 'bosc-resident':
+            missing = sorted({port // 4 for port in nodes[0].ports} - resident['topology_boards'].keys())
+            if missing:
+                raise ValueError(f'resident.topology_boards must cover every enabled FPGA board (missing={missing})')
     if backend == 'bosc-resident' or 'init_scripts' in resident:
         scripts = resident.get('init_scripts')
         if not isinstance(scripts, dict) or not scripts:
@@ -193,22 +220,45 @@ def load(path):
         raise ValueError('explicit_allocation must be a boolean')
     if type(resident.get('keep_load_files', False)) is not bool:
         raise ValueError('keep_load_files must be a boolean')
-    # i_ddr[0] corresponds to this profile's physical DDR base, not a user-selected base.
-    if resident.get('output_ddr_base', 0x80000000) != 0x80000000 or type(resident.get('output_ddr_base', 0x80000000)) is not int:
-        raise ValueError('output_ddr_base must be 0x80000000 for this hardware profile')
-    for name, default, maximum in (('output_ddr_bytes', 4194304, 268435456),
-                                    ('max_output_bytes', 16777216, 16777216)):
-        value = resident.get(name, default)
-        if type(value) is not int or not 1 <= value <= maximum:
-            raise ValueError(f'{name} must be an integer within 1..{maximum}')
-    if resident.get('output_ddr_bytes', 4194304) % 64:
+    # nanhu_xilinx.i_ddr[0] maps to this profile's physical DDR base with 64-byte elements.
+    base = resident.get('output_ddr_base', 0x80000000)
+    if type(base) is not int or base < 0 or base % 64:
+        raise ValueError('output_ddr_base must be a nonnegative integer multiple of 64')
+    span = resident.get('output_ddr_bytes', 4194304)
+    if type(span) is not int or not 64 <= span <= 2147483648:
+        raise ValueError('output_ddr_bytes must be an integer within 64..2147483648')
+    if span % 64:
         raise ValueError('output_ddr_bytes must be a multiple of 64')
+    if base + span > 2 ** 32:
+        raise ValueError('output_ddr_base + output_ddr_bytes must not exceed the 4 GiB physical address space')
+    if resident.get('output_ddr_read_mode', 'prefix') not in ('prefix', 'window'):
+        raise ValueError("output_ddr_read_mode must be 'prefix' or 'window'")
+    if type(resident.get('verify_readback', True)) is not bool:
+        raise ValueError('verify_readback must be a boolean')
+    if 'load_timeout' in resident:
+        value = resident['load_timeout']
+        positive(value, 'load_timeout')
+        if value > 86400:
+            raise ValueError('load_timeout must be at most 86400 seconds')
+    max_output = resident.get('max_output_bytes', 16777216)
+    if type(max_output) is not int or not 1 <= max_output <= 268435456:
+        raise ValueError('max_output_bytes must be an integer within 1..268435456')
     for name in fields - {'hardware_project', 'lock_dir', 'profile', 'shared_clock_index', 'output_ddr_base',
-                          'explicit_allocation', 'keep_load_files', 'init_scripts'}:
+                          'verify_readback', 'output_ddr_read_mode',
+                          'explicit_allocation', 'keep_load_files', 'init_scripts', 'topology_boards'}:
         if name in resident:
             positive(resident[name], name)
     for name in ('recovery_attempts', 'max_job_log_bytes', 'max_session_log_bytes', 'max_storage_bytes'):
         if name in resident and type(resident[name]) is not int:
             raise ValueError(f'{name} must be an integer')
+    # Materialize the documented deployment defaults that Session consumes.
+    # Without this, an omitted max_output_bytes would fall back to the 256 MiB
+    # protocol ceiling instead of the 16 MiB deployment default in the docs.
+    resident.setdefault('output_ddr_base', 0x80000000)
+    resident.setdefault('output_ddr_bytes', 4194304)
+    resident.setdefault('output_ddr_read_mode', 'prefix')
+    resident.setdefault('verify_readback', True)
+    resident.setdefault('load_timeout', 600)
+    resident.setdefault('max_output_bytes', 16777216)
     data['resident'] = resident
     return Config(**data)

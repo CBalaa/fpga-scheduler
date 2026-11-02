@@ -69,7 +69,7 @@ class ResidentTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def emit(self):
-        seen = {4: 0, 5: 0}
+        seen = {p: 0 for p in self.masters}
         while not self.stop_emitter.wait(.005):
             for p, fd in self.masters.items():
                 path = self.backend.root / 'ports' / str(p) / 'release'
@@ -83,11 +83,19 @@ class ResidentTests(unittest.TestCase):
                 if mode in ('hang', 'partial-start'):
                     os.write(fd, b'ordinary PASS\n' if mode == 'hang' else b'@@FPGA_START {"version":')
                     continue
+                start = b'@@FPGA_START {"version":1}\n'
+                if mode.startswith('window:'):
+                    # A 'window:<address>:<nbytes>' image asks the fake app to
+                    # declare one <u4> output at a nonzero DDR element offset.
+                    _, address, nbytes = mode.split(':')
+                    declaration = dict(version=1, name='result', address=address,
+                                       nbytes=int(nbytes), dtype='<u4', shape=[1])
+                    start += b'@@FPGA_OUTPUT ' + json.dumps(declaration).encode() + b'\n'
                 record = dict(version=1, status='exited', app_exit_code=int(mode) if mode.lstrip('-').isdigit() else 0)
                 if mode == 'trap':
                     record = dict(version=1, status='trap', mcause='0x2', mepc='0x80000000', mtval='0x0')
                 terminal = ('@@FPGA_RESULT ' + json.dumps(record) + '\n').encode()
-                data = b'@@FPGA_START {"version":1}\n' + mode.encode() + b'\n' + terminal
+                data = start + mode.encode() + b'\n' + terminal
                 if mode == 'duplicate':
                     data += terminal
                 for i in range(0, len(data), 11):
@@ -110,6 +118,28 @@ class ResidentTests(unittest.TestCase):
     def ready(self):
         ports = self.backend.probe('local')
         self.assertTrue(all(p['available'] for p in ports), ports)
+
+    def manage_fpga0(self):
+        """Exercise fpga113's unloaded B0 with a real UART and Tcl session."""
+        self.stop_emitter.set()
+        self.emitter.join()
+        self.backend.close()
+        script = self.root / 'deployment/init/init0.tcl'
+        script.write_text(self.initialization(0, explicit=True, clock=True))
+        self.init_scripts[0] = script
+        # Reuse the existing port 4 PTY. The emitter follows the managed port's
+        # release file while the test still exercises Session's real UART path.
+        (self.root / 'uart0').symlink_to((self.root / 'uart4').resolve())
+        self.masters[0] = self.masters.pop(4)
+        self.node = replace(self.node, ports=(0,))
+        self.backend = Resident((self.node,), self.root / 'state', hardware_project=self.project,
+                                lock_dir=self.root / 'locks', init_scripts=self.init_scripts,
+                                topology_boards={0: 'TB1', 1: 'TB2'},
+                                startup_timeout=2, command_timeout=1,
+                                uart_quiet_seconds=.03, recovery_backoff=.01)
+        self.stop_emitter.clear()
+        self.emitter = threading.Thread(target=self.emit)
+        self.emitter.start()
 
     @staticmethod
     def initialization(port, *, explicit=False, clock=False):
@@ -161,6 +191,7 @@ class ResidentTests(unittest.TestCase):
         self.assertFalse((session.directory / 'release').exists())
 
     def test_initialization_errors_timeout_and_unconfirmed_reset_never_become_ready(self):
+        self.backend.recovery_attempts = 4
         for fault in ('FAKE_INIT_ERROR', 'FAKE_INIT_REPORTED_ERROR',
                       'FAKE_INIT_DELAY', 'FAKE_RESET_QUERY_ZERO'):
             with self.subTest(fault=fault):
@@ -428,6 +459,7 @@ class ResidentTests(unittest.TestCase):
                     worker.join(4)
             result = q.get(payload['id'])['result']
             self.assertEqual(result['execution_status'], 'cancelled')
+            self.assertEqual(result['exit_code'], 130)
             self.assertTrue(result['details']['reset_confirmed'])
             self.assertFalse((session.directory / 'release').exists())
             self.assertFalse((self.backend.root / 'jobs' / payload['id'] / 'start-intent.json').exists())
@@ -484,7 +516,7 @@ class ResidentTests(unittest.TestCase):
             q.cancel(tasks[1]['id'])
             q.close()
 
-    def test_real_slow_load_cancel_and_missing_ack_quarantine(self):
+    def test_real_slow_load_cancel_and_missing_ack_requests_recovery(self):
         self.ready()
         session = self.backend.sessions[4]
         session.command('set ::env(FAKE_LOAD_DELAY) 500')
@@ -512,18 +544,265 @@ class ResidentTests(unittest.TestCase):
             # A command that never acknowledges within its bound cannot be
             # followed by reset while Tcl may still be executing writemem.
             session.command('set ::env(FAKE_LOAD_DELAY) 2000')
-            session.command_timeout = .1
+            session.load_timeout = .2
             result = self.run_task(self.task(2))
             self.assertEqual(result['execution_status'], 'platform_error')
             self.assertEqual(result['details']['interrupted_status'], 'timeout')
             self.assertFalse(result['details']['reset_confirmed'])
             self.assertIn('unacknowledged', result['details']['cleanup_error'])
-            self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+            self.assertEqual(result['details']['memory_ack_timeout'], 'writemem')
+            self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
             self.assertFalse((session.directory / 'release').exists())
             self.assertIs(self.backend.sessions[4], session)
             self.assertEqual(session.downloads, 1)
         finally:
             q.close()
+
+    def test_memory_ack_timeout_retires_old_shell_and_recovers_only_failed_port(self):
+        self.ready()
+        sibling = self.backend.sessions[5]
+        for i, (env, command) in enumerate((('FAKE_LOAD_DELAY', 'writemem'),
+                                             ('FAKE_READ_DELAY', 'readmem')), 1):
+            with self.subTest(command=command):
+                session = self.backend.sessions[4]
+                session.command(f'set ::env({env}) 2000')
+                session.load_timeout = .2
+                result = self.run_task(self.task(i * 2))
+                self.assertEqual(result['execution_status'], 'platform_error', result)
+                self.assertEqual(result['details']['memory_ack_timeout'], command)
+                self.assertEqual(result['details']['interrupted_status'], 'timeout')
+                self.assertFalse(result['details']['reset_confirmed'])
+                self.assertTrue(session.command_pending)
+                self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+                self.assertFalse((self.backend.root / 'jobs' / f'{i * 2:032x}' / 'start-intent.json').exists())
+                original_query = self.backend._physical
+                def physical_after_retirement():
+                    self.assertIsNotNone(session.process.poll(), 'Inventory must follow old shell retirement')
+                    return original_query()
+                time.sleep(.02)
+                with patch.object(self.backend, '_physical', side_effect=physical_after_retirement), \
+                     patch.object(session, 'command', wraps=session.command) as old_command:
+                    self.ready()
+                old_command.assert_not_called()
+                current = self.backend.sessions[4]
+                self.assertIsNot(current, session)
+                self.assertNotEqual(current.epoch, session.epoch)
+                self.assertNotEqual(current.process.pid, session.process.pid)
+                self.assertIsNotNone(session.process.poll())
+                self.assertIs(self.backend.sessions[5], sibling)
+                self.assertIsNone(sibling.process.poll())
+                self.assertEqual(sibling.downloads, 1)
+                result = self.run_task(self.task(i * 2 + 1))
+                self.assertEqual(result['exit_code'], 0, result)
+                self.assertEqual(result['details']['session'], current.epoch)
+                self.assertTrue(result['details']['ddr_readback_matches'])
+                self.assertTrue(result['details']['reset_confirmed'])
+                self.assertEqual((current.directory / 'downloads').read_text().splitlines(),
+                                 ['download'] * (i + 1))
+
+    def test_background_memory_recovery_without_waiting_jobs_does_not_replay_failure(self):
+        self.ready()
+        session, sibling = self.backend.sessions[4], self.backend.sessions[5]
+        session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+        session.load_timeout = .2
+        q = JobQueue(self.root / 'memory-recovery.db', self.backend, self.images,
+                     interval=.01, cooldown=0)
+        payload = self.task(1)
+        try:
+            q.submit(payload)
+            q.start()
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                failed = q.get(payload['id'])
+                ports = q.inventory_snapshot()['devices']
+                recovered = next(p for p in ports if p['number'] == 4)
+                if (failed['state'] == 'failed' and recovered['available']
+                        and recovered['session'] != session.epoch):
+                    break
+                time.sleep(.01)
+            else:
+                self.fail(f'Background recovery did not complete: {failed}, {ports}')
+            self.assertEqual(failed['result']['details']['memory_ack_timeout'], 'writemem')
+            self.assertEqual(failed['result']['details']['session'], session.epoch)
+            self.assertIsNotNone(session.process.poll())
+            self.assertIs(self.backend.sessions[5], sibling)
+            self.assertFalse((self.backend.root / 'jobs' / payload['id'] / 'start-intent.json').exists())
+            self.assertEqual(q.db.execute('SELECT count(*) FROM jobs').fetchone()[0], 1)
+            self.assertFalse((session.directory / 'release').exists())
+            recovered_session = self.backend.sessions[4]
+            q.submit(self.task(2))
+            deadline = time.monotonic() + 5
+            while q.get(f'{2:032x}')['state'] not in ('completed', 'failed') and time.monotonic() < deadline:
+                time.sleep(.01)
+            completed = q.get(f'{2:032x}')
+            self.assertEqual(completed['state'], 'completed', completed)
+            self.assertEqual(completed['result']['details']['session'], recovered_session.epoch)
+            self.assertEqual(q.get(payload['id'])['state'], 'failed')
+            self.assertEqual((session.directory / 'release').read_text().splitlines(), ['hello'])
+        finally:
+            q.close()
+
+    def test_repeated_memory_failures_exhaust_budget_without_reset_on_reinitialization(self):
+        self.ready()
+        self.assertEqual(self.backend.recovery_attempts, 5)
+        sibling = self.backend.sessions[5]
+        for i in range(1, self.backend.recovery_attempts + 2):
+            session = self.backend.sessions[4]
+            session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+            session.load_timeout = .2
+            result = self.run_task(self.task(i))
+            self.assertEqual(result['details']['memory_ack_timeout'], 'writemem')
+            self.assertEqual(self.backend.states[4]['memory_recoveries'], i)
+            if i <= self.backend.recovery_attempts:
+                self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+                self.backend.states[4]['next_retry'] = 0
+                self.ready()
+                self.assertIsNot(self.backend.sessions[4], session)
+                self.assertEqual(self.backend.states[4]['memory_recoveries'], i)
+            else:
+                self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+                self.assertIn('budget exhausted', self.backend.states[4]['reason'])
+                with patch.object(self.backend, '_initialize') as initialize:
+                    ports = self.backend.probe('local')
+                initialize.assert_not_called()
+                self.assertFalse(next(p for p in ports if p['number'] == 4)['available'])
+                self.assertIs(self.backend.sessions[4], session)
+        self.assertIs(self.backend.sessions[5], sibling)
+        self.assertEqual((sibling.directory / 'downloads').read_text().splitlines(), ['download'])
+
+    def test_only_successful_application_resets_memory_recovery_budget(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+        session.load_timeout = .2
+        self.run_task(self.task(1))
+        self.backend.states[4]['next_retry'] = 0
+        self.ready()
+        self.assertEqual(self.backend.states[4]['memory_recoveries'], 1)
+        self.assertEqual(self.run_task(self.task(2, '7'))['app_exit_code'], 7)
+        self.assertEqual(self.backend.states[4]['memory_recoveries'], 1)
+        self.assertEqual(self.run_task(self.task(3))['exit_code'], 0)
+        self.assertEqual(self.backend.states[4]['memory_recoveries'], 0)
+
+    def test_retirement_failure_preserves_session_locks_and_blocks_new_shell(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+        session.load_timeout = .2
+        self.run_task(self.task(1))
+        record = session.record.read_bytes()
+        serial, master = session.serial, session.master
+        with patch('fpga_scheduler.remote.uvhs_session.retire_record',
+                   side_effect=RuntimeError('injected unconfirmed process retirement')), \
+             patch.object(self.backend, '_physical') as physical, \
+             patch('fpga_scheduler.backends.resident.Session') as replacement:
+            self.backend._initialize(4)
+        replacement.assert_not_called()
+        physical.assert_not_called()
+        self.assertIs(self.backend.sessions[4], session)
+        self.assertEqual(session.record.read_bytes(), record)
+        self.assertFalse(session.retired)
+        self.assertFalse(session.closed)
+        self.assertEqual((session.serial, session.master), (serial, master))
+        self.assertFalse(session.port_lock.closed)
+        self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+        self.assertEqual(self.backend.states[4]['attempts'], 1)
+        self.assertIn('unconfirmed process retirement', self.backend.states[4]['reason'])
+        self.backend.states[4]['next_retry'] = 0
+        self.ready()
+        self.assertTrue(session.retired)
+        self.assertIsNot(self.backend.sessions[4], session)
+
+    def test_retired_shell_with_remaining_owner_never_allocates_and_eventually_quarantines(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+        session.load_timeout = .2
+        self.run_task(self.task(1))
+        physical = {p: dict(owner='', booked=False, power='on') for p in range(8)}
+        physical[4]['owner'] = 'unreleased-owner'
+        with patch.object(self.backend, '_physical', return_value=physical), \
+             patch('fpga_scheduler.backends.resident.Session') as replacement:
+            for _ in range(self.backend.recovery_attempts):
+                self.backend._initialize(4)
+        replacement.assert_not_called()
+        self.assertTrue(session.retired)
+        self.assertNotIn(4, self.backend.sessions)
+        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+        self.assertEqual(self.backend.states[4]['attempts'], self.backend.recovery_attempts)
+        self.assertIn('ownership has not retired', self.backend.states[4]['reason'])
+
+    def test_close_is_idempotent_after_process_group_retirement(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        clean = session.close()
+        self.assertTrue(session.retired)
+        self.assertTrue(session.closed)
+        self.assertIsNotNone(session.process.poll())
+        self.assertIsNone(session.serial)
+        self.assertIsNone(session.master)
+        self.assertTrue(session.port_lock.closed)
+        with patch('fpga_scheduler.remote.uvhs_session.retire_record') as retire, \
+             patch('fpga_scheduler.remote.uvhs_session.os.close') as close:
+            self.assertEqual(session.close(), clean)
+        retire.assert_not_called()
+        close.assert_not_called()
+
+    def test_close_metadata_failure_retries_without_retiring_or_closing_descriptors_again(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        with patch('fpga_scheduler.remote.uvhs_session.atomic_json',
+                   side_effect=OSError('injected final metadata failure')):
+            with self.assertRaisesRegex(OSError, 'final metadata failure'):
+                session.close()
+        self.assertTrue(session.retired)
+        self.assertFalse(session.closed)
+        self.assertIsNone(session.serial)
+        self.assertIsNone(session.master)
+        self.assertTrue(session.port_lock.closed)
+        with patch('fpga_scheduler.remote.uvhs_session.retire_record') as retire, \
+             patch('fpga_scheduler.remote.uvhs_session.os.close') as close, \
+             patch('fpga_scheduler.remote.uvhs_session.atomic_json',
+                   side_effect=lambda path, value: path.write_text(json.dumps(value))):
+            session.close()
+        retire.assert_not_called()
+        close.assert_not_called()
+        self.assertTrue(session.closed)
+        self.assertTrue(json.loads(session.record.read_text())['processes_retired'])
+
+    def test_backend_close_continues_other_ports_when_one_retirement_fails(self):
+        self.ready()
+        session, sibling = self.backend.sessions[4], self.backend.sessions[5]
+        with patch.object(session, 'close', side_effect=RuntimeError('injected retirement failure')):
+            with self.assertRaisesRegex(RuntimeError, 'injected retirement failure'):
+                self.backend.close()
+        self.assertTrue(self.backend.stopped)
+        self.assertEqual(self.backend.sessions, {4: session})
+        self.assertTrue(sibling.closed)
+        self.assertIsNotNone(sibling.process.poll())
+        self.backend.close()
+        self.assertEqual(self.backend.sessions, {})
+        self.assertTrue(session.closed)
+
+    def test_stop_blocks_pending_memory_recovery_without_starting_new_shell(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 2000')
+        session.load_timeout = .2
+        result = self.run_task(self.task(1))
+        self.assertEqual(result['details']['memory_ack_timeout'], 'writemem')
+        self.backend.states[4]['next_retry'] = 0
+        self.backend.stop_initialization()
+        with patch('fpga_scheduler.backends.resident.Session') as replacement, \
+             patch.object(self.backend, '_physical') as physical:
+            ports = self.backend.probe('local')
+        replacement.assert_not_called()
+        physical.assert_not_called()
+        self.assertIs(self.backend.sessions[4], session)
+        self.assertFalse(next(p for p in ports if p['number'] == 4)['available'])
+        self.backend.close()
+        self.assertTrue(session.retired)
+        self.assertIsNotNone(session.process.poll())
 
     def test_failed_timeout_reset_quarantines_without_automatic_rebuild(self):
         self.ready()
@@ -574,7 +853,7 @@ class ResidentTests(unittest.TestCase):
         self.assertIn('UART', self.backend.states[4]['reason'])
         self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
 
-    def test_cancel_during_unresponsive_command_is_platform_failure_and_quarantined(self):
+    def test_cancel_during_unresponsive_memory_command_is_platform_failure_and_recovers(self):
         self.ready()
         from fpga_scheduler.models import Cancellation
         from fpga_scheduler.remote.uvhs_session import CommandTimeout
@@ -592,7 +871,110 @@ class ResidentTests(unittest.TestCase):
             result = self.backend.run(payload, 'local', 4, cancellation=control)
         self.assertEqual(result['execution_status'], 'platform_error')
         self.assertEqual(result['details']['interrupted_status'], 'cancelled')
-        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+        self.assertEqual(result['details']['memory_ack_timeout'], 'writemem')
+        self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+
+    def test_load_delay_longer_than_execution_timeout_still_succeeds(self):
+        # The old code charged writemem time to payload['timeout'] and clamped
+        # it to command_timeout=1. The load phase now has its own budget.
+        self.ready()
+        session = self.backend.sessions[4]
+        session.command('set ::env(FAKE_LOAD_DELAY) 1100')
+        payload = self.task(1)
+        payload['timeout'] = 1
+        result = self.run_task(payload)
+        self.assertEqual(result['execution_status'], 'exited', result)
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertGreaterEqual(result['details']['load_seconds'], 1.0)
+        self.assertTrue(result['details']['ddr_readback_matches'])
+        self.assertTrue(result['details']['reset_confirmed'])
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+
+    def test_load_deadline_overrun_reports_execution_timeout(self):
+        self.ready()
+        session = self.backend.sessions[4]
+        session.load_timeout = .05
+        original = session.boundary
+        slept = []
+        def boundary():
+            if not slept:
+                slept.append(1)
+                time.sleep(.2)  # Cross the load deadline inside a non-command step.
+            return original()
+        payload = self.task(1)
+        self.backend.prepare(payload, 'local', self.images.freeze(payload['id'], payload['sha256']))
+        with patch.object(session, 'boundary', side_effect=boundary):
+            result = self.backend.run(payload, 'local', 4)
+        self.assertEqual(result['execution_status'], 'timeout', result)
+        self.assertEqual(result['exit_code'], 124, result)
+        self.assertIsNone(result['app_exit_code'])
+        self.assertIn('input load deadline', result['details']['error'])
+        self.assertEqual(result['details']['load_timeout_seconds'], .05)
+        self.assertTrue(result['details']['reset_confirmed'])
+        self.assertFalse(result['details']['application_started'])
+        self.assertNotIn('load_seconds', result['details'])
+        self.assertFalse((self.backend.root / 'jobs' / payload['id'] / 'start-intent.json').exists())
+        commands = (session.directory / 'control-commands').read_text().splitlines()
+        self.assertFalse(any(line.startswith('writemem ') for line in commands))
+        self.assertIs(self.backend.sessions[4], session)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+
+    def test_verify_readback_disabled_skips_load_readback_and_prunes(self):
+        self.backend.options['verify_readback'] = False
+        self.ready()
+        session = self.backend.sessions[4]
+        self.assertFalse(session.verify_readback)
+        ident = f'{11:032x}'
+        token = b'window:0x80000100:4'
+        content = token + bytes(0x100 - len(token)) + b'\x0a\x0b\x0c\x0d' + bytes(64)
+        digest = self.images.put(ident, content)
+        payload = dict(id=ident, sha256=digest, timeout=2, idle_seconds=1, queue_timeout=60)
+        commands_path = session.directory / 'control-commands'
+        before = commands_path.read_text().splitlines()
+        result = self.run_task(payload)
+        commands = commands_path.read_text().splitlines()[len(before):]
+        release = commands.index('reset -name cpu_reset -value 0')
+        self.assertEqual(sum(line.startswith('writemem ') for line in commands[:release]), 1)
+        self.assertFalse(any(line.startswith('readmem ') for line in commands[:release]))
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertTrue(result['details']['ddr_readback_skipped'])
+        self.assertNotIn('ddr_readback_matches', result['details'])
+        self.assertTrue(result['details']['reset_confirmed'])
+        self.assertIn('load_seconds', result['details'])
+        directory = self.backend.root / 'jobs' / ident
+        self.assertFalse((directory / 'image.bin').exists())
+        self.assertFalse((directory / 'readback.bin').exists())
+        self.assertEqual(self.backend.artifact_path(ident, 'result').read_bytes(), b'\x0a\x0b\x0c\x0d')
+
+    def test_window_read_mode_extracts_nonzero_low_bytes(self):
+        self.backend.options['output_ddr_read_mode'] = 'window'
+        self.ready()
+        session = self.backend.sessions[4]
+        self.assertEqual(session.output_read_mode, 'window')
+        ident = f'{12:032x}'
+        token = b'window:0x80000100:4'
+        content = token + bytes(0x100 - len(token)) + b'\xde\xad\xbe\xef' + bytes(64)
+        digest = self.images.put(ident, content)
+        payload = dict(id=ident, sha256=digest, timeout=2, idle_seconds=1, queue_timeout=60)
+        result = self.run_task(payload)
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertEqual(len(result['artifacts']), 1, result)
+        self.assertEqual(self.backend.artifact_path(ident, 'result').read_bytes(), b'\xde\xad\xbe\xef')
+        self.assertTrue(result['details']['ddr_readback_matches'])
+        self.assertIn('load_seconds', result['details'])
+        commands = (session.directory / 'control-commands').read_text().splitlines()
+        reads = [line for line in commands if line.startswith('readmem ') and 'i_ddr[4:4]' in line]
+        self.assertEqual(len(reads), 1, commands)
+        self.assertEqual(self.backend.states[4]['state'], 'READY')
+
+    def test_reserve_storage_estimates_window_snapshot_by_max_output(self):
+        first, second = self.task(1), self.task(3)
+        self.backend.reserve_storage(first, self.images.path(first['id']))
+        prefix = self.backend.storage_reserved.pop(first['id'])
+        self.backend.options['output_ddr_read_mode'] = 'window'
+        self.backend.reserve_storage(second, self.images.path(second['id']))
+        window = self.backend.storage_reserved.pop(second['id'])
+        self.assertEqual(window - prefix, 16777216 - 4194304)
 
     def test_shared_board_same_clock_initializes_only_whitelisted_free_ports(self):
         physical = {p: dict(owner='foreign' if p == 6 else '', booked=False, power='on') for p in range(8)}
@@ -615,6 +997,151 @@ class ResidentTests(unittest.TestCase):
         self.assertEqual(set(self.backend.sessions), {4, 5})
         self.assertTrue(all(not (s.directory / 'clock-configs').exists()
                             for s in self.backend.sessions.values()))
+
+    @staticmethod
+    def inventory_rows(ports, *, topology=False, overrides=None):
+        rows = []
+        for p in ports:
+            info = dict(power='on', owner='', booked='false')
+            info.update((overrides or {}).get(p, {}))
+            board = f'TB{p // 4 + 1}' if topology else f'B{p // 4}'
+            rows.append(f'uvhs-0 {board} F{p % 4} {info["power"]} link down '
+                        f'{info["owner"]} {info["booked"]}')
+        return '\n'.join(rows)
+
+    def test_topology_initializes_unloaded_b0_and_runs_through_real_uart(self):
+        self.manage_fpga0()
+        # fpga113 can report only B1 until the B0 initializer loads its DB.
+        # The physical TB1 view still supplies occupancy and shared clocks.
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7',
+                        FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7',
+                        FAKE_CLOCK_ROWS='B1 6 5.529600 NA PLL'), \
+             patch.object(self.backend, '_hardware_query', wraps=self.backend._hardware_query) as query:
+            self.ready()
+            result = self.run_task(self.task(1), port=0)
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertTrue(result['details']['ddr_readback_matches'])
+        self.assertTrue(result['details']['reset_confirmed'])
+        self.assertEqual(set(self.backend.sessions), {0})
+        commands = (self.backend.sessions[0].directory / 'control-commands').read_text().splitlines()
+        self.assertIn('allocate -board b0.f0', commands)
+        self.assertEqual(commands.count('download'), 1)
+        self.assertEqual(commands.count('initialize'), 1)
+        self.assertTrue(any('query -fpgas -all -tb' in c.args[0] for c in query.call_args_list))
+        self.assertTrue(any('query -clock -tb' in c.args[0] for c in query.call_args_list))
+
+    def test_topology_or_runtime_target_ownership_and_booking_prevent_initialization(self):
+        self.manage_fpga0()
+        scenarios = (
+            dict(physical={0: dict(owner='foreign(55560)')}),
+            dict(physical={0: dict(booked='true')}),
+            dict(runtime={0: dict(owner='foreign')}),
+            dict(runtime={0: dict(booked='true')}),
+        )
+        for scenario in scenarios:
+            with self.subTest(scenario=scenario):
+                env = dict(FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7',
+                           FAKE_TOPOLOGY_ROWS=self.inventory_rows(
+                               range(8), topology=True, overrides=scenario.get('physical')),
+                           FAKE_FPGA_ROWS=self.inventory_rows(
+                               range(8) if 'runtime' in scenario else range(4, 8),
+                               overrides=scenario.get('runtime')))
+                with patch.dict(os.environ, env), \
+                     patch.object(self.backend, '_uart_busy') as uart, \
+                     patch.object(self.backend, '_clocks') as clocks, \
+                     patch('fpga_scheduler.backends.resident.Session') as session:
+                    self.backend._initialize(0)
+                uart.assert_not_called()
+                clocks.assert_not_called()
+                session.assert_not_called()
+                self.assertEqual(self.backend.states[0]['state'], 'RECOVERING')
+                self.assertIn('occupied', self.backend.states[0]['reason'])
+                self.assertFalse(self.backend.sessions)
+
+    def test_topology_unknown_power_or_booking_never_allocates(self):
+        self.manage_fpga0()
+        for status in (dict(power='unknown'), dict(booked='unknown'), dict(power='off')):
+            with self.subTest(status=status), \
+                 patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7',
+                            FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7',
+                            FAKE_TOPOLOGY_ROWS=self.inventory_rows(
+                                range(8), topology=True, overrides={0: status})), \
+                 patch('fpga_scheduler.backends.resident.Session') as session:
+                self.backend._initialize(0)
+                session.assert_not_called()
+                self.assertNotEqual(self.backend.states[0]['state'], 'READY')
+                self.assertFalse(self.backend.sessions)
+
+    def test_topology_conflicting_board_mapping_or_missing_target_metadata_blocks(self):
+        self.manage_fpga0()
+        board_format = '{:<17}{:<22}{:<17}{:<35}{:<27}{:<18}{:<17}{:<17}{}'
+        wrong_board = board_format.format('uvhs-0', 'TB1', 'V1', 'SIMULATED-BOARD-0',
+                                          '', 'B1', '', '', '0s')
+        for override in (dict(FAKE_TOPOLOGY_BOARD_ROWS=wrong_board),
+                         dict(FAKE_TOPOLOGY_BOARD_ROWS=''),
+                         dict(FAKE_TOPOLOGY_FPGA_ROWS='')):
+            with self.subTest(override=override), \
+                 patch.dict(os.environ, dict(FAKE_FPGA_PORTS='4 5 6 7',
+                                             FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7', **override)), \
+                 patch('fpga_scheduler.backends.resident.Session') as session:
+                self.backend._initialize(0)
+                session.assert_not_called()
+                self.assertNotEqual(self.backend.states[0]['state'], 'READY')
+                self.assertFalse(self.backend.sessions)
+
+    def test_topology_unloaded_board_retains_sibling_shared_clock_gate(self):
+        self.manage_fpga0()
+        env = dict(FAKE_FPGA_PORTS='4 5 6 7', FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7',
+                   FAKE_TOPOLOGY_ROWS=self.inventory_rows(
+                       range(8), topology=True, overrides={1: dict(owner='foreign')}))
+        for frequency in ('14.745600', None):
+            clocks = '' if frequency is None else f'TB1 6 {frequency} NA PLL'
+            with self.subTest(frequency=frequency), \
+                 patch.dict(os.environ, dict(env, FAKE_TOPOLOGY_CLOCK_ROWS=clocks)), \
+                 patch('fpga_scheduler.backends.resident.Session') as session:
+                self.backend._initialize(0)
+                session.assert_not_called()
+                self.assertEqual(self.backend.states[0]['state'], 'RECOVERING')
+                self.assertIn('Shared B0.GCLK6', self.backend.states[0]['reason'])
+                self.assertFalse(self.backend.sessions)
+        # A verified compatible clock allows this independent free target.
+        self.backend.states[0]['next_retry'] = 0
+        with patch.dict(os.environ, env):
+            self.ready()
+        self.assertEqual(set(self.backend.sessions), {0})
+
+    def test_topology_incomplete_sibling_metadata_cannot_configure_clock(self):
+        self.manage_fpga0()
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7',
+                        FAKE_TOPOLOGY_PORTS='0 2 3 4 5 6 7'), \
+             patch('fpga_scheduler.backends.resident.Session') as session:
+            self.backend._initialize(0)
+        session.assert_not_called()
+        self.assertEqual(self.backend.states[0]['state'], 'RECOVERING')
+        self.assertIn('inventory missing FPGA1', self.backend.states[0]['reason'])
+        self.assertFalse(self.backend.sessions)
+
+    def test_topology_board_aggregate_owner_protects_clock_without_occupying_target(self):
+        self.manage_fpga0()
+        with patch.dict(os.environ, FAKE_FPGA_PORTS='4 5 6 7',
+                        FAKE_TOPOLOGY_PORTS='0 1 2 3 4 5 6 7',
+                        FAKE_TOPOLOGY_BOARD_USER='someone(123)'):
+            physical = self.backend._physical()
+            self.assertEqual(physical[0]['owner'], '')
+            self.assertEqual(physical[0]['board_owners'], ['someone(123)'])
+            for frequency in ('14.745600', None):
+                clocks = '' if frequency is None else f'TB1 6 {frequency} NA PLL'
+                with self.subTest(frequency=frequency), \
+                     patch.dict(os.environ, FAKE_TOPOLOGY_CLOCK_ROWS=clocks), \
+                     patch('fpga_scheduler.backends.resident.Session') as session:
+                    self.backend._initialize(0)
+                    session.assert_not_called()
+                    self.assertEqual(self.backend.states[0]['state'], 'RECOVERING')
+                    self.assertIn('Shared B0.GCLK6', self.backend.states[0]['reason'])
+                    self.assertFalse(self.backend.sessions)
+            self.backend.states[0]['next_retry'] = 0
+            self.ready()
+        self.assertEqual(set(self.backend.sessions), {0})
 
     def test_missing_target_does_not_prevent_other_target_with_verified_clock(self):
         with patch.dict(os.environ, FAKE_FPGA_PORTS='4'):
@@ -1229,6 +1756,171 @@ class RegisteredInitializationTests(unittest.TestCase):
         self.assertEqual((current.directory / 'init.tcl').read_bytes(), originals[7])
         self.assertEqual({number: path.read_bytes() for number, path in self.init_scripts.items()}, originals)
         self.assertEqual({path.name for path in (second.root / 'ports').iterdir()}, {'6', '7'})
+
+    def dirty_record(self, port=4, **changes):
+        record = dict(epoch='a' * 32, number=port, pid=999999999, start_ticks='1',
+                      dirty=True, closed_cleanly=False, processes_retired=True)
+        record.update(changes)
+        path = self.root / 'state/resident/ports' / str(port) / 'session.json'
+        atomic_json(path, record)
+        return path
+
+    def test_disabled_retired_dirty_session_is_preserved_without_hardware_access(self):
+        from fpga_scheduler.remote.init_script import load_init_script
+        from fpga_scheduler.remote.uvhs_session import Session
+        path = self.dirty_record()
+        original = path.read_bytes()
+        self.init_scripts[4].write_text('error disabled_script_must_not_be_read\nexit\n')
+        with patch('fpga_scheduler.backends.resident.load_init_script', wraps=load_init_script) as scripts, \
+             patch('fpga_scheduler.backends.resident.Session', wraps=Session) as sessions, \
+             patch('fpga_scheduler.backends.resident.retire_record', wraps=retire_record) as retire:
+            backend = self.resident(6)
+            self.assertEqual(backend.disabled_dirty, {4})
+            retire.assert_not_called()
+            self.assertTrue(backend.probe('local')[0]['available'])
+        self.assertTrue(all(c.args[1] == 6 for c in scripts.call_args_list))
+        self.assertEqual([c.args[1] for c in sessions.call_args_list], [6])
+        self.assertNotIn(path, [c.args[0] for c in retire.call_args_list])
+        self.assertEqual(path.read_bytes(), original)
+        self.assertEqual([p.name for p in path.parent.iterdir()], ['session.json'])
+
+    def test_disabled_dirty_session_requires_complete_verified_retirement(self):
+        changes = [dict(processes_retired=False), dict(processes_retired=1),
+                   dict(pid=None), dict(pid=True), dict(pid=-1),
+                   dict(start_ticks=None), dict(start_ticks=1), dict(start_ticks='0'),
+                   dict(number=7), dict(number=True)]
+        for change in changes:
+            with self.subTest(change=change):
+                path = self.dirty_record(**change)
+                original = path.read_bytes()
+                with patch('fpga_scheduler.backends.resident.Session') as sessions, \
+                     patch('fpga_scheduler.backends.resident.group_members') as members, \
+                     patch('fpga_scheduler.backends.resident.retire_record') as retire:
+                    with self.assertRaisesRegex(RuntimeError, 'Disabled FPGA4.*unverified'):
+                        self.resident(6)
+                sessions.assert_not_called()
+                members.assert_not_called()
+                retire.assert_not_called()
+                self.assertEqual(path.read_bytes(), original)
+
+    def test_disabled_dirty_live_descendant_is_rejected_without_signalling(self):
+        import signal
+        import subprocess
+        child_file = self.root / 'descendant'
+        code = ('import subprocess,sys,time;from pathlib import Path;'
+                'p=subprocess.Popen([sys.executable,"-c","import time;time.sleep(30)"]);'
+                'Path(sys.argv[1]).write_text(str(p.pid));time.sleep(.2)')
+        leader = subprocess.Popen([sys.executable, '-c', code, str(child_file)], start_new_session=True)
+        try:
+            ticks = fingerprint(leader.pid)
+            leader.wait(timeout=3)
+            self.assertTrue(child_file.exists())
+            path = self.dirty_record(pid=leader.pid, start_ticks=ticks)
+            original = path.read_bytes()
+            with patch('fpga_scheduler.backends.resident.retire_record') as retire, \
+                 patch('fpga_scheduler.remote.uvhs_session.os.killpg') as kill:
+                with self.assertRaisesRegex(RuntimeError, 'Disabled FPGA4.*live UVHS process group'):
+                    self.resident(6)
+            retire.assert_not_called()
+            kill.assert_not_called()
+            self.assertEqual(path.read_bytes(), original)
+            os.kill(int(child_file.read_text()), 0)
+        finally:
+            try:
+                os.killpg(leader.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            leader.wait(timeout=3)
+
+    def test_disabled_dirty_identity_or_record_errors_fail_closed(self):
+        path = self.dirty_record()
+        original = path.read_bytes()
+        with patch('fpga_scheduler.backends.resident.group_members',
+                   side_effect=RuntimeError('Recorded UVHS PID was reused')):
+            with self.assertRaisesRegex(RuntimeError, 'PID was reused'):
+                self.resident(6)
+        self.assertEqual(path.read_bytes(), original)
+        path.write_text('{broken record')
+        with self.assertRaises(ValueError):
+            self.resident(6)
+        self.assertEqual(path.read_text(), '{broken record')
+        for value in (None, [], 'invalid record'):
+            path.write_text(json.dumps(value))
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, 'must be a JSON object'):
+                self.resident(6)
+            self.assertEqual(json.loads(path.read_text()), value)
+
+    def test_only_boolean_clean_flag_can_skip_disabled_dirty_checks(self):
+        for value in ('false', 1):
+            path = self.dirty_record(closed_cleanly=value)
+            original = path.read_bytes()
+            backend = self.resident(6)
+            self.assertEqual(backend.disabled_dirty, {4})
+            self.assertEqual(path.read_bytes(), original)
+
+    def test_disabled_dirty_sibling_still_requires_matching_shared_clock(self):
+        path = self.dirty_record()
+        original = path.read_bytes()
+        self.init_scripts[6].write_text(ResidentTests.initialization(6, explicit=True, clock=True))
+        backend = self.resident(6)
+        physical = {p: dict(owner='', booked=False, power='on') for p in range(4, 8)}
+        for clocks in ({}, {(1, 6): 14745600}):
+            with self.subTest(clocks=clocks), \
+                 patch.object(backend, '_physical', return_value=physical), \
+                 patch.object(backend, '_clocks', return_value=clocks), \
+                 patch('fpga_scheduler.backends.resident.Session') as sessions:
+                backend._initialize(6)
+                self.assertNotEqual(backend.states[6]['state'], 'READY')
+                self.assertIn('FPGA4 active', backend.states[6]['reason'])
+                sessions.assert_not_called()
+        with patch.object(backend, '_physical', return_value=physical), \
+             patch.object(backend, '_clocks', return_value={(1, 6): 5529600}):
+            backend._initialize(6)
+        self.assertEqual(backend.states[6]['state'], 'READY')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_disabled_dirty_sibling_remains_active_even_without_physical_row(self):
+        self.dirty_record()
+        backend = self.resident(6)
+        physical = {p: dict(owner='', booked=False, power='on') for p in (5, 6, 7)}
+        with patch.object(backend, '_clocks', return_value={}):
+            self.assertIsNone(backend._initialization_script(6, physical))
+        self.assertIn('FPGA4 active', backend.states[6]['reason'])
+
+    def test_disabled_dirty_other_board_does_not_block_clock_initialization(self):
+        path = self.dirty_record(port=0)
+        original = path.read_bytes()
+        self.init_scripts[6].write_text(ResidentTests.initialization(6, explicit=True, clock=True))
+        backend = self.resident(6)
+        physical = {p: dict(owner='', booked=False, power='on') for p in range(4, 8)}
+        with patch.object(backend, '_physical', return_value=physical), \
+             patch.object(backend, '_clocks', return_value={(1, 6): 14745600}):
+            backend._initialize(6)
+        self.assertEqual(backend.states[6]['state'], 'READY')
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_reenabled_dirty_target_keeps_owner_booked_and_full_initialization_checks(self):
+        path = self.dirty_record(port=6)
+        old_epoch = json.loads(path.read_text())['epoch']
+        backend = self.resident(6)
+        self.assertEqual(backend.disabled_dirty, set())
+        physical = {p: dict(owner='', booked=False, power='on') for p in range(4, 8)}
+        for changed in (dict(owner='another-user'), dict(booked=True)):
+            physical[6].update(changed)
+            with patch.object(backend, '_physical', return_value=physical), \
+                 patch('fpga_scheduler.backends.resident.Session') as sessions:
+                backend._initialize(6)
+            sessions.assert_not_called()
+            self.assertNotEqual(backend.states[6]['state'], 'READY')
+            physical[6].update(owner='', booked=False)
+        with patch.object(backend, '_physical', return_value=physical):
+            backend._initialize(6)
+        self.assertEqual(backend.states[6]['state'], 'READY')
+        current = backend.sessions[6]
+        self.assertNotEqual(current.epoch, old_epoch)
+        commands = (current.directory / 'control-commands').read_text().splitlines()
+        self.assertEqual(commands.count('download'), 1)
+        self.assertEqual(commands.count('initialize'), 1)
 
 
 class LogTests(unittest.TestCase):

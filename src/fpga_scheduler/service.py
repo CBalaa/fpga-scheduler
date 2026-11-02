@@ -14,7 +14,7 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 from .backends.simulator import Simulator
-from .models import ACTIVE, MAX_IMAGE, Conflict
+from .models import ACTIVE, MAX_IMAGE, MAX_IMAGE_CHUNK, Conflict
 from .queue import JobQueue
 from .storage import Images, StorageQuotaExceeded
 
@@ -47,7 +47,7 @@ def read_token(path):
     return token
 
 
-def make_server(address, queue, images, token):
+def make_server(address, queue, images, token, upload_timeout=120):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.0'
 
@@ -84,6 +84,18 @@ def make_server(address, queue, images, token):
             if len(body) != size:
                 raise ValueError('Incomplete request body')
             return body
+
+        def touch_image_session(self):
+            # Image requests may optionally carry the submitting client's lease.
+            # Validate it before reading the body and refresh the heartbeat so a
+            # slow upload cannot expire the session mid-transfer.
+            ident = self.headers.get('X-FPGA-Session')
+            if ident is None:
+                return
+            try:
+                queue.touch_session(ident)
+            except ValueError:
+                raise Conflict('Client session missing, closed or expired; create a new Client') from None
 
         def artifact(self, ident, name):
             handle, item = queue.open_artifact(ident, name)
@@ -148,13 +160,33 @@ def make_server(address, queue, images, token):
                         raise ValueError('Invalid output query parameters')
                     self.reply(200, queue.output(match[1], int(query.get('offset', ['0'])[0]),
                                                  int(query.get('limit', ['65536'])[0])))
+                elif self.command == 'GET' and match and match[2] == '/image':
+                    if path.query:
+                        raise ValueError('Image status does not accept query parameters')
+                    self.touch_image_session()
+                    self.reply(200, images.status(match[1]))
                 elif self.command == 'GET' and match and not match[2]:
                     self.reply(200, queue.get(match[1]))
                 elif self.command == 'DELETE' and match and not match[2]:
                     self.reply(200, queue.cancel(match[1]))
                 elif self.command == 'PUT' and match and match[2] == '/image':
-                    digest = images.put(match[1], self.body(MAX_IMAGE))
-                    self.reply(200, dict(id=match[1], sha256=digest))
+                    query = parse_qs(path.query, keep_blank_values=True)
+                    if path.query and (set(query) != {'offset'} or len(query['offset']) != 1):
+                        raise ValueError('Invalid image query parameters')
+                    if 'offset' in query:
+                        value = query['offset'][0]
+                        if re.fullmatch(r'0|[1-9][0-9]*', value) is None:
+                            raise ValueError('Image offset must be a nonnegative integer')
+                        offset = int(value)
+                        self.touch_image_session()
+                        self.connection.settimeout(upload_timeout)
+                        self.reply(200, dict(id=match[1],
+                                             **images.append(match[1], offset, self.body(MAX_IMAGE_CHUNK))))
+                    else:
+                        self.touch_image_session()
+                        self.connection.settimeout(upload_timeout)
+                        digest = images.put(match[1], self.body(min(MAX_IMAGE, images.max_image_bytes)))
+                        self.reply(200, dict(id=match[1], sha256=digest))
                 elif self.command == 'POST' and route == '/jobs':
                     ident = self.headers.get('X-FPGA-Session')
                     if ident is None:
@@ -203,7 +235,8 @@ class Application:
         try:
             images = Images(config.state_dir / 'images',
                             max_bytes=config.resident.get('max_storage_bytes', 1073741824) // 2
-                            if config.backend == 'bosc-resident' else None)
+                            if config.backend == 'bosc-resident' else None,
+                            max_image_bytes=config.max_image_bytes)
             if config.backend == 'simulator':
                 backend = Simulator(config.nodes, **config.simulator)
             elif config.backend == 'bosc-resident':
@@ -218,7 +251,8 @@ class Application:
                                   cooldown=config.cooldown_seconds, retention=config.retention_days * 86400,
                                   client_heartbeat_seconds=config.client_heartbeat_seconds,
                                   client_lease_seconds=config.client_lease_seconds)
-            self.server = make_server((config.bind, config.port), self.queue, images, self.token)
+            self.server = make_server((config.bind, config.port), self.queue, images, self.token,
+                                      upload_timeout=config.upload_timeout)
         except BaseException:
             self.close()
             raise

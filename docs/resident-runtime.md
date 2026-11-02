@@ -20,6 +20,28 @@ booked 或受管会话时，只有只读确认该板此 index 的实际频率为
 每次新建 UVHS 会话都刷新独立工作目录的 `hw.dat` 链接，使用配置工程当前指向的版本。
 切换工程版本后需正常停止并重新启动 daemon；已有会话不会在任务之间自动切换 bitstream。
 
+**动态 runtime 分区与物理拓扑发现。** 某些 UVHS 主机的 `query -fpgas -all` 只列出当时已挂接的
+runtime 分区；目标缺行不能证明物理设备不存在，也不能证明它空闲。此类主机可在现有
+`[resident]` 表中启用显式映射，例如：
+
+```toml
+[resident]
+topology_boards = {"0" = "TB1", "1" = "TB2"}
+```
+
+键是初始化 Tcl 使用的逻辑 B 板号：`B0.F0–F3` 对应端口 0–3，`B1.F0–F3` 对应 4–7；
+值是该主机已核验的真实拓扑板号。该示例不是固定偏移公式，不能根据 TB 编号减一或查询行序
+生成映射。键使用规范的非负数字字符串，值使用 `TB` 加规范非负数字；表非空、值唯一，
+并覆盖所有启用端口所属板。允许提前登记未启用板的映射。
+
+此模式使用 topology 发现和映射信息、`query -fpgas -all -tb` 的物理 Power/Owner/Booked，
+再与普通 runtime inventory 交叉核验；按同一显式映射解析 `query -clock -tb` 的共享时钟。
+目标分区尚未挂接时仍须取得完整物理状态，任何来源的 owner、预约或占用信息都不能被另一
+张表的空字段覆盖。目标及同板检查通过后，才允许原初始化流程分配、装载和挂接分区。
+厂商不支持所需查询、目标缺失、信息不完整或映射冲突时阻塞并报告原因，不回退为“空闲”，
+也不跳过所有权、预约或共享时钟检查。未配置 `topology_boards` 时继续采用原 runtime
+inventory 模式；该模式仍会拒绝查询中缺失的目标。
+
 ### 准备部署初始化文件
 
 这一步由人或部署 AI 在启动服务前完成，scheduler 运行时不自动从硬件脚本提取初始化部分。
@@ -63,6 +85,11 @@ fpga-scheduler daemon status
 
 无需改动 `init_scripts` 或 Tcl 文件；最终必须看到 FPGA7 为 `READY`。占用、锁、共享时钟、
 命令确认、超时和 CPU 复位检查仍然生效；不能删除时钟命令来绕过共享时钟保护。
+已禁用的故障端口若保留 `closed_cleanly=false`，scheduler 仅在记录明确声明进程已退役、
+PID/启动时刻身份完整且实际进程组为空时，允许其他启用端口启动。原脏记录保持不变，
+不读取该禁用端口的初始化 Tcl、不打开其 UART，也不重新分配硬件；同板共享时钟检查仍把
+它视为活跃兄弟端口。身份不完整或仍有活进程时拒绝启动，不能删除记录或手工标记 clean。
+以后重新启用该端口仍须通过完整准入和初始化。
 
 初始化文件路径相对 **TOML 配置文件目录**解析（绝对路径也可），支持开头的 `~`，
 不展开 `$HOME` 等环境变量。脚本执行 cwd 是常驻会话的隔离工作目录；`./hw.dat` 指向
@@ -126,12 +153,14 @@ SHA-256，`ports` 单独记录启用白名单。工具不执行硬件命令，�
 更换 wheel 和明确迁移配置，再启动；不要用此首次安装工具覆盖已有部署。
 从加载厂商环境的登录 shell 启动，supervisor 继承环境，SSH 断开后继续运行。
 start 等待 API 就绪；Resident 的后台维护线程随后初始化白名单端口，即使没有排队任务也会进行。
+首次服务构造失败会立即返回具体原因并停止重试，诊断保存在
+`state/daemon/service-stderr.log` 的有界轮转日志中；已运行服务的异常退出仍按退避策略恢复。
 `devices` / `daemon status` 只读最近一次设备快照，不触发 UVHS 命令，也不等待初始化或硬件锁。
 首次采样完成前显示 `RECOVERING` / `Hardware initialization pending`；响应中的 `refreshing`
 表示后台查询正在进行，`sampled_at` 标明最近完成采样的时间。初始化完成后显示 `READY` 或
 具体拒绝/失败原因。设备快照可能暂时滞后，任务调度仍使用新查询结果和端口预留检查。
 stop 停止接收和调度，等待运行任务及卸载，保留 queued 并抑制重启。
-supervisor 回收自己登记的 UVHS 进程组，退避重启异常退出的 daemon；不保证主机重启、
+supervisor 回收本配置启用端口登记的 UVHS 进程组和探测进程，退避重启异常退出的 daemon；不保证主机重启、
 supervisor 被杀或系统清理用户进程后自动启动。可选 [systemd 模板](../deploy/fpga-scheduler.service.in)
 运行 serve 前台模式，由管理员显式安装，避免叠加两层 supervisor。
 
@@ -169,7 +198,13 @@ python examples/resident/run.py hello.bin --token-file client.token --mode multi
 尽量主动关闭会话并取消全部未结束任务；崩溃、SIGKILL、断网由租约兜底，默认每 2 秒心跳、
 15 秒失联取消。后台 daemon 心跳线程独立于输出读取，不阻止 Python 退出；关闭流或等待超时
 本身不取消。服务配置 client_heartbeat_seconds / client_lease_seconds 或 SDK 同名去掉 client_ 前缀
-的参数可调整。其他客户端查询、读取输出不会续租。没有 detached 模式。
+的参数可调整。其他客户端查询、读取输出不会续租。
+
+镜像分片上传的每个 PUT/GET 可带 `X-FPGA-Session`：daemon 校验会话仍有效并顺带续租，
+所以即使大镜像上传期间独立心跳请求被延迟，租约也不会到期；会话确实过期后分片请求
+返回 409，需要新建 Client。分片上传是断点续传的，传输失败只重试未落盘部分。慢速链路
+或超大镜像建议把服务端 client_heartbeat_seconds 调大（如 5）、client_lease_seconds
+调大（如 120），并相应调大客户端 request_timeout（单个分片请求的超时）。没有 detached 模式。
 排队取消不操作硬件；运行取消先进入 cancelling，worker 串行收尾后才完成并释放槽位。
 CLI 使用 fpga-scheduler run hello.bin --timeout 120 保持前台，Ctrl+C 取消；submit 命令是前台同义命令。
 服务独立执行期限；正常 daemon stop 仍 drain，不因停止服务而主动取消任务。
@@ -186,16 +221,32 @@ UVHS 命令通过随机 session + 递增序号的 Tcl catch 回应确认，
 同一 shell 反复执行任务，正常任务不重复初始化或下载；正常 stop 清理资源并退出该 shell，
 故障恢复若需重建会话，重新执行配置的初始化文件。
 
-每任务保留 1 MiB 补齐、DDR 64 字节元素写入/读回逐字节比较、入口 0x80000000、
-rv64gc/lp64d、5.5296 MHz / 115200 UART。释放 CPU 前 fsync start intent，
-收尾复位、UART 静默边界确认后原子保存结果，再释放执行槽。普通 PASS 不表示任务成功。
+每任务保留 1 MiB 补齐、入口 0x80000000、rv64gc/lp64d、5.5296 MHz / 115200 UART。
+任务期限分为两段：装载阶段（复位确认、补齐镜像、`writemem`、可选 `readmem` 逐字节比较、
+UART 静默边界）由 `[resident].load_timeout` 单独限制，默认 600 秒、上限 86400 秒；
+应用执行期限（`timeout`，1–86400 秒）从释放 CPU 复位开始到收到终态 UART 记录，不包含
+装载时间。`verify_readback = false` 可跳过装载后的全量读回以缩短大镜像装载时间，
+结果记录 `ddr_readback_skipped=true`；首次运行新镜像建议保持开启。
+释放 CPU 前 fsync start intent，收尾复位、UART 静默边界确认后原子保存结果，
+再释放执行槽。普通 PASS 不表示任务成功。
 正常退出（含非零应用码）保留会话。取消/超时在 CPU 复位读回及 UART 清理均成功后
 同样保留 UVHS PID/session、回到 READY，不重新 download/initialize、不进入失败冷却。
 取消/超时打断半条 UART 协议记录时，在确认复位与静默边界后记录 `uart_record_interrupted=true`，
 不将截断本身当作收尾失败；完整记录的格式、顺序和重复检查仍有效。
-取消/超时期间控制通道或收尾失败则 QUARANTINED，记录原因，不自动完整重建。
-装载取消等待当前 writemem/readmem 确认结束后收尾；等待受 command_timeout 约束。
-UVHS 命令没有确认时不再并发发送 reset，按平台失败隔离，禁止释放 CPU 和写入下一任务。
+装载期间收到取消不会中断正在等待确认的 writemem/readmem：该命令只受装载期限约束，
+确认返回后在下一个安全检查点按取消收尾。装载期间单条 writemem/readmem 的 Tcl 确认超时
+仍按"内存确认超时"处理：
+任务以平台失败结束（`details.memory_ack_timeout`），端口进入 RECOVERING 并走重建流程，
+因为未确认的控制通道不能安全复用；只有装载总期限在安全检查点被超过时才按
+执行器 timeout / exit_code 124 结束。镜像 writemem/readmem 或输出 readmem 确认超时，
+当前任务按平台失败结束，不自动重放 bin；
+端口进入 RECOVERING，禁止在未确认结束的 shell 中继续发送 reset、释放 CPU 或写入下一任务。
+恢复只退休本端口已登记的 UVHS 进程组，确认其全部退出且硬件占用已释放后，
+重新通过端口锁、占用及共享时钟检查，启动新 shell 并执行原初始化 Tcl；确认 CPU 复位后才可 READY。
+内存确认超时的连续恢复次数独立累计，初始化成功不清零；只有完整成功任务清零。
+最多自动重建 recovery_attempts 次（默认 5 次）；用尽次数后再次发生内存确认超时，或无法确认旧进程组退出、
+无法完成安全重建时隔离并记录原因。
+普通取消/应用超时的 CPU 复位或 UART 收尾失败仍 QUARANTINED，不据此自动重建。
 其余 trap/平台/协议故障按同一共享时钟检查重建目标端口，不等待同频的其他 FPGA 空闲。
 重试有上限和指数退避，最终隔离至管理员停服检查。应用返回 0 而收尾失败仍 ok=False。
 
@@ -211,18 +262,61 @@ SQLite WAL+FULL，状态目录单实例；端口 flock 覆盖 session 并由 UVH
 启动到登记之间的极小崩溃窗口保守保持实际占用，不抢占无法归属的进程。
 物理执行与主机持久化不能提供严格 exactly-once。
 
+## 大镜像与大模型运行
+
+整模型 bin 通常超过旧的 16 MiB 单次上传上限，且执行时间可能远超 600 秒。建议按
+[configs/resident-llm.example.toml](../configs/resident-llm.example.toml) 调整部署：
+
+| 配置 | 用途 |
+|---|---|
+| 顶层 `max_image_bytes` | 允许的单个镜像字节数，默认 16 MiB；按模型 bin 大小设置并留出余量 |
+| 顶层 `client_heartbeat_seconds` / `client_lease_seconds` | 慢速上传时的租约；可设 5 / 120 |
+| 顶层 `upload_timeout` | 单个镜像请求的 socket 读超时，默认 120 秒 |
+| `[resident] load_timeout` | 装载阶段总期限（复位+DDR 写入+可选读回），大镜像需按实测放大 |
+| `[resident] verify_readback` | 首次运行新镜像保持 true；稳定后可关闭以缩短装载 |
+| `[resident] output_ddr_base` / `output_ddr_bytes` | 输出物理窗口；必须覆盖 logits 等输出地址，上限 2 GiB span |
+| `[resident] output_ddr_read_mode` | 远地址输出用 `window`（需一次性 A/B 硬件校验，见 [DDR 输出](outputs.md)）；未校验前用 `prefix` 并放大窗口与存储 |
+| `[resident] max_output_bytes` | 每任务导出总量，默认 16 MiB，上限 256 MiB |
+| `[resident] max_storage_bytes` | 输入与 resident 工件各占一半；大镜像+读回+快照需整体放大 |
+
+客户端无需特殊参数，`Client.submit`/`run_test` 会自动分片并流式计算 SHA256；
+可用 `upload_chunk_bytes`（默认 4 MiB）和 `request_timeout` 适配链路。示例：
+
+~~~python
+from fpga_scheduler import Client
+
+with Client("http://127.0.0.1:18765", token_file="client.token",
+            request_timeout=120) as client:
+    task = client.submit("model.bin", timeout=7200)   # 仅执行期限，不含装载
+    finished = client.wait(task.id, timeout=None, poll_interval=5)
+    print(finished.state, finished.result.execution_status)
+    for artifact in finished.result.artifacts:
+        client.download_artifact(task.id, artifact["name"], artifact["name"] + ".bin")
+~~~
+
+升级已有部署的步骤：正常 `daemon stop` 排空任务 → 替换已安装 wheel（用同一
+运行时重建的 wheel，勿只覆盖旧部署）→ 修改 config.local.toml → `daemon start` →
+`devices` 看到目标端口 READY → 先跑小 bin 验证装载/读回/复位，再跑大模型。
+daemon 升级前已保存的任务记录和输入按原保留策略继续可用；旧 daemon 不支持分片上传，
+必须先升级 daemon 再上传超过 16 MiB 的镜像。
+
 ## 存储、验收与限制
 
 state_dir 保存 SQLite、images、resident/jobs/<id> 的 UART、镜像/readback、start intent 和结果；
 resident/ports/<port> 保存 session 身份和控制日志。输入与 resident 工件各使用 max_storage_bytes
 一半预算（默认各 512 MiB），与文件系统剩余空间分别检查。
 任务分配端口前预留峰值空间；已经落盘的活动文件只占已用空间，对该任务仅保留尚未落盘的预算，
-避免双端口并发时重复计账。预算覆盖补齐镜像、DDR 读回、UART 与其 JSON 结果副本、输出快照及 artifacts。
+避免双端口并发时重复计账。预算覆盖补齐镜像、DDR 读回、UART 与其 JSON 结果副本、输出快照及
+artifacts；输出快照按读取模式估算（prefix 为整个 `output_ddr_bytes` 窗口，window 为
+`max_output_bytes` 级），所以远地址小输出应优先使用 window 模式，否则需要为 622 MiB 级
+快照预留存储。输入上限由顶层 `max_image_bytes` 控制（默认 16 MiB，可配到 4 GiB），
+应与 `max_storage_bytes` 一半的输入配额匹配。
 UART 有上限，超限失败；
 控制日志保留当前及上一份，service/supervisor 日志轮转。厂商自身日志计入 resident 配额，
 但由厂商写入；准入检查不能替代文件系统硬配额，管理员仍需监控空间。
 
-默认 `keep_load_files=false`：任务原子保存结果、确认 DDR 读回匹配和 CPU 复位后，
+默认 `keep_load_files=false`：任务原子保存结果、确认 DDR 读回匹配（或读回已按
+`verify_readback=false` 跳过，即 `ddr_readback_skipped=true`）和 CPU 复位后，
 删除该任务的 `image.bin/readback.bin` 装载副本；取消/超时符合这两个条件也可回收。
 校验失败、未确认安全收尾或无可靠终态的任务保留这些文件。
 启动升级后的服务时，同样回收符合条件的历史副本；`keep_load_files=true` 可保留至完整任务过期，供调试使用。

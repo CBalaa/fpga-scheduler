@@ -45,7 +45,10 @@ def parser():
         submit = _command(commands, name, help='Run in foreground; Ctrl+C cancels (submit is an alias)')
         submit.add_argument('image')
         submit.add_argument('--id', dest='ident')
-        submit.add_argument('--timeout', type=int, default=600)
+        submit.add_argument('--name', help='Task name (default: binary filename)')
+        submit.add_argument('--timeout', type=int, default=600,
+                            help='Application execution deadline in seconds (1..86400); DDR load is '
+                                 'bounded separately by the daemon resident.load_timeout')
         submit.add_argument('--idle-seconds', type=int, default=60)
         submit.add_argument('--queue-timeout', type=int, default=3600)
     for name in ('job', 'cancel', 'wait'):
@@ -74,6 +77,7 @@ def main(argv=None):
     color = not args.json and color_enabled(args.color)
     error_color = not args.json and color_enabled(args.color, sys.stderr)
     client = None
+    serve_initialized = False
     try:
         if args.command == 'init-token':
             path = Path(args.path)
@@ -99,7 +103,9 @@ def main(argv=None):
             config.state_dir.mkdir(parents=True, exist_ok=True)
             logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s',
                                 handlers=[RotatingFileHandler(config.state_dir / 'service.log', maxBytes=1048576, backupCount=3)])
-            Application(config).serve()
+            application = Application(config)
+            serve_initialized = True
+            application.serve()
             return 0
         client = Client(args.endpoint, token_file=args.token_file)
         if args.command == 'artifacts':
@@ -108,11 +114,11 @@ def main(argv=None):
             path = client.download_artifact(args.id, args.name, args.destination)
             result = dict(id=args.id, name=args.name, path=str(path))
         elif args.command in ('run', 'submit'):
-            task = client.submit(args.image, ident=args.ident, timeout=args.timeout,
+            task = client.submit(args.image, ident=args.ident, name=args.name, timeout=args.timeout,
                                  idle_seconds=args.idle_seconds, queue_timeout=args.queue_timeout)
             print(f'[FPGA] Task {task.id} (Ctrl+C cancels)', file=sys.stderr, flush=True)
             last_chunk = ''
-            with client.stream_output(task.id, timeout=args.queue_timeout + args.timeout + 300) as stream:
+            with client.stream_output(task.id, timeout=args.queue_timeout + args.timeout + 1800) as stream:
                 def update(current):
                     if current.state == 'queued' and current.waiting_reason:
                         print(paint(f'[FPGA] Queued #{current.position}: {current.waiting_reason}',
@@ -152,6 +158,9 @@ def main(argv=None):
         if not args.json:
             for line in capacity_details(data.get('error_details')):
                 print(line, file=sys.stderr)
+        if args.command == 'serve' and not serve_initialized:
+            from .daemon import SERVICE_STARTUP_EXIT
+            return SERVICE_STARTUP_EXIT
         return 1
     except KeyboardInterrupt:
         print(paint('Interrupted; cancelling this client\'s unfinished tasks', 'yellow', color=error_color), file=sys.stderr)

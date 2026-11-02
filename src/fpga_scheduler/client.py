@@ -17,7 +17,7 @@ from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 import uuid
 
-from .models import ACTIVE, MAX_IMAGE, task_id, validate
+from .models import ACTIVE, MAX_IMAGE, MAX_IMAGE_CHUNK, MAX_IMAGE_LIMIT, task_id, validate
 from .artifacts import validate_artifacts, output_name
 
 
@@ -95,6 +95,7 @@ class Task:
     waiting_details: dict | None = None
     error_details: dict | None = None
     retry_at: float | None = None
+    name: str | None = None
 
     @classmethod
     def from_dict(cls, value):
@@ -202,7 +203,8 @@ class OutputStream:
 
 class Client:
     def __init__(self, endpoint='http://127.0.0.1:8765', token=None, *, token_file=None, request_timeout=30,
-                 heartbeat_seconds=None, lease_seconds=None):
+                 heartbeat_seconds=None, lease_seconds=None,
+                 upload_chunk_bytes=4 * 1024 * 1024, upload_attempts=5):
         parsed = urlsplit(endpoint)
         if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.query or parsed.fragment:
             raise ValueError('endpoint must be an HTTP(S) base URL')
@@ -221,6 +223,14 @@ class Client:
                 raise ValueError(f'{name} must be within 0.01..3600')
         if heartbeat_seconds is not None and lease_seconds is not None and heartbeat_seconds >= lease_seconds:
             raise ValueError('heartbeat_seconds must be less than lease_seconds')
+        if (isinstance(upload_chunk_bytes, bool) or not isinstance(upload_chunk_bytes, int)
+                or not 1 <= upload_chunk_bytes <= MAX_IMAGE_CHUNK):
+            raise ValueError(f'upload_chunk_bytes must be an integer within 1..{MAX_IMAGE_CHUNK}')
+        if (isinstance(upload_attempts, bool) or not isinstance(upload_attempts, int)
+                or not 1 <= upload_attempts <= 100):
+            raise ValueError('upload_attempts must be an integer within 1..100')
+        self.upload_chunk_bytes = upload_chunk_bytes
+        self.upload_attempts = upload_attempts
         self._session_options = {k: v for k, v in dict(heartbeat_seconds=heartbeat_seconds,
                                                       lease_seconds=lease_seconds).items() if v is not None}
         self._init_session_state()
@@ -321,33 +331,148 @@ class Client:
         except (URLError, TimeoutError, OSError, ValueError, HTTPException) as error:
             raise SchedulerError(f'Connection or response failed ({type(error).__name__}); query the same task ID before resubmitting') from None
 
-    def submit(self, image, *, ident=None, timeout=600, idle_seconds=60, queue_timeout=3600):
-        ident = uuid.uuid4().hex if ident is None else ident
-        content = Path(image).read_bytes()
-        if not 0 < len(content) <= MAX_IMAGE:
-            raise ValueError('Image must be nonempty and at most 16 MiB')
-        payload = validate(dict(id=ident, sha256=hashlib.sha256(content).hexdigest(), timeout=timeout,
-                                idle_seconds=idle_seconds, queue_timeout=queue_timeout))
+    @staticmethod
+    def _image_status(value, ident):
+        if (not isinstance(value, dict) or value.get('id') != ident
+                or type(value.get('uploaded_bytes')) is not int or value['uploaded_bytes'] < 0
+                or type(value.get('complete')) is not bool):
+            raise SchedulerError('Invalid image status response', ident=ident)
+        limit = value.get('max_image_bytes')
+        if type(limit) is not int or not 1 <= limit <= MAX_IMAGE_LIMIT:
+            raise SchedulerError('Invalid image status response', ident=ident)
+        return value
+
+    def _image_status_request(self, ident, session):
+        value = self._request('/jobs/' + ident + '/image', session=session)
+        return self._image_status(value, ident)
+
+    def _post_job(self, payload, session):
+        # POST alone is idempotent for the same ID and parameters; retry only a
+        # lost response, never create a new ID automatically.
         try:
-            session = self._ensure_session()
-            try:
-                self._request('/jobs/' + ident + '/image', method='PUT', raw=content)
-            except SchedulerError as error:
-                # A submitted ID has frozen input. POST below determines whether
-                # this is an identical retry, or a conflicting use of that ID.
-                if error.status != 409:
-                    raise
-            try:
-                return Task.from_dict(self._request('/jobs', payload, 'POST', session=session))
-            except SchedulerError as error:
-                if error.status is not None:
-                    raise
-                # POST alone is idempotent; never create a new ID automatically.
-                return Task.from_dict(self._request('/jobs', payload, 'POST', session=session))
+            return Task.from_dict(self._request('/jobs', payload, 'POST', session=session))
         except SchedulerError as error:
-            error.task_id = ident
-            error.args = (f'{error}; task ID: {ident}',)
-            raise
+            if error.status is not None:
+                raise
+            return Task.from_dict(self._request('/jobs', payload, 'POST', session=session))
+
+    def _legacy_submit(self, image, size, ident, payload, session):
+        # Older daemons expose only the legacy single-shot image PUT (16 MiB).
+        if size > MAX_IMAGE:
+            raise SchedulerError(
+                f'Daemon does not support chunked image upload and legacy single-shot uploads are limited '
+                f'to {MAX_IMAGE} bytes; upgrade the daemon to submit this {size}-byte image',
+                ident=ident, details=dict(error_code='daemon_upgrade_required', image_bytes=size,
+                                          legacy_max_image_bytes=MAX_IMAGE))
+        content = image.read_bytes()
+        try:
+            self._request('/jobs/' + ident + '/image', method='PUT', raw=content, session=session)
+        except SchedulerError as error:
+            # Frozen input is tolerated here; the POST below decides whether this
+            # is an identical retry or a conflicting reuse of the task ID.
+            if error.status != 409:
+                raise
+        return self._post_job(payload, session)
+
+    def _upload_chunks(self, handle, size, ident, session, offset):
+        """Upload sequentially from offset; resume at the server's durable offset.
+
+        The server stores each chunk durably before replying, so a lost response
+        is repaired by re-reading the upload status and continuing after the
+        bytes that are already safe. At most upload_attempts attempts are made
+        for one offset with a short exponential backoff.
+        """
+        attempts = 0
+        while offset < size:
+            handle.seek(offset)
+            chunk = handle.read(min(self.upload_chunk_bytes, size - offset))
+            if not chunk:
+                raise SchedulerError('Image file changed during upload; start a new submission', ident=ident)
+            try:
+                value = self._request('/jobs/' + ident + '/image?' + urlencode(dict(offset=offset)),
+                                      method='PUT', raw=chunk, session=session)
+            except SchedulerError as error:
+                if error.status is not None and error.status != 409 and error.status < 500:
+                    raise
+                attempts += 1
+                if attempts >= self.upload_attempts:
+                    raise
+                time.sleep(min(.05 * 2 ** (attempts - 1), 1))
+                status = self._image_status_request(ident, session)
+                if status['complete']:
+                    return status['uploaded_bytes']
+                if status['uploaded_bytes'] > size:
+                    raise SchedulerError(
+                        f'Daemon already holds {status["uploaded_bytes"]} bytes for this task ID, more than '
+                        f'this {size}-byte image; use a new task ID', status=409,
+                        details=dict(error_code='image_upload_conflict',
+                                     uploaded_bytes=status['uploaded_bytes'], image_bytes=size))
+                if status['uploaded_bytes'] > offset:
+                    attempts = 0  # Real progress: resume past the stored bytes.
+                offset = status['uploaded_bytes']
+                continue
+            if (not isinstance(value, dict) or value.get('id') != ident
+                    or value.get('offset') != offset
+                    or type(value.get('next_offset')) is not int
+                    or not offset < value['next_offset'] <= size):
+                raise SchedulerError('Invalid chunk upload response', ident=ident)
+            offset = value['next_offset']
+            attempts = 0
+        return offset
+
+    def submit(self, image, *, ident=None, name=None, timeout=600, idle_seconds=60, queue_timeout=3600):
+        ident = uuid.uuid4().hex if ident is None else ident
+        image = Path(image)
+        try:
+            handle = image.open('rb')
+        except OSError:
+            raise ValueError(f'Image file is not readable: {image}') from None
+        with handle:
+            size = os.fstat(handle.fileno()).st_size
+            if size <= 0:
+                raise ValueError('Image must be nonempty')
+            digest = hashlib.sha256()
+            while block := handle.read(self.upload_chunk_bytes):
+                digest.update(block)
+            if name is None or isinstance(name, str) and not name.strip():
+                name = image.name
+            payload = validate(dict(id=ident, name=name, sha256=digest.hexdigest(), timeout=timeout,
+                                    idle_seconds=idle_seconds, queue_timeout=queue_timeout))
+            try:
+                session = self._ensure_session()
+                try:
+                    status = self._image_status_request(ident, session)
+                except SchedulerError as error:
+                    if error.status != 404:
+                        raise
+                    return self._legacy_submit(image, size, ident, payload, session)
+                limit = status['max_image_bytes']
+                if size > limit:
+                    raise SchedulerError(
+                        f'Image is {size} bytes but the daemon max_image_bytes limit is {limit} bytes; '
+                        'increase max_image_bytes in the daemon configuration or submit a smaller image',
+                        status=400, details=dict(error_code='image_too_large', image_bytes=size,
+                                                 max_image_bytes=limit))
+                if status['complete']:
+                    if status['uploaded_bytes'] != size:
+                        raise SchedulerError(
+                            f'Task ID already has a frozen {status["uploaded_bytes"]}-byte input; use a new '
+                            'task ID for different content', status=409,
+                            details=dict(error_code='image_upload_conflict',
+                                         uploaded_bytes=status['uploaded_bytes'], image_bytes=size))
+                    return self._post_job(payload, session)
+                if status['uploaded_bytes'] > size:
+                    raise SchedulerError(
+                        f'Daemon already holds {status["uploaded_bytes"]} bytes for this task ID, more than '
+                        f'this {size}-byte image; use a new task ID', status=409,
+                        details=dict(error_code='image_upload_conflict',
+                                     uploaded_bytes=status['uploaded_bytes'], image_bytes=size))
+                self._upload_chunks(handle, size, ident, session, status['uploaded_bytes'])
+                return self._post_job(payload, session)
+            except SchedulerError as error:
+                error.task_id = ident
+                error.args = (f'{error}; task ID: {ident}',)
+                raise
 
     def job(self, ident):
         return Task.from_dict(self._request('/jobs/' + task_id(ident)))
@@ -451,7 +576,7 @@ class Client:
         return OutputStream(self, ident, offset=offset, timeout=timeout, poll_interval=poll_interval)
 
     def run_test(self, image, timeout=600, idle_seconds=60, queue_timeout=3600, show=True, *,
-                 stream=True, poll_interval=.2):
+                 stream=True, poll_interval=.2, name=None):
         """Submit and return an OutputStream by default.
 
         Iterate the stream to read UART text, then inspect stream.result.
@@ -462,9 +587,9 @@ class Client:
         if type(stream) is not bool:
             raise ValueError('stream must be a boolean')
         OutputStream._validate(0, None, poll_interval)
-        task = self.submit(image, timeout=timeout, idle_seconds=idle_seconds, queue_timeout=queue_timeout)
+        task = self.submit(image, name=name, timeout=timeout, idle_seconds=idle_seconds, queue_timeout=queue_timeout)
         print(f'[FPGA] Task {task.id}', flush=True)
-        reader = OutputStream(self, task.id, timeout=queue_timeout + timeout + 300,
+        reader = OutputStream(self, task.id, timeout=queue_timeout + timeout + 1800,
                               poll_interval=poll_interval)
         if stream:
             return reader
@@ -480,12 +605,12 @@ class Client:
                     # Older daemons do not expose /output. Retain SDK compatibility.
                     if error.status != 404:
                         raise
-                    task = self.wait(task.id, timeout=queue_timeout + timeout + 300)
+                    task = self.wait(task.id, timeout=queue_timeout + timeout + 1800)
                     if task.result is not None:
                         print(task.result.output)
                     return self._result(task)
                 return reader.result
-            task = self.wait(task.id, timeout=queue_timeout + timeout + 300)
+            task = self.wait(task.id, timeout=queue_timeout + timeout + 1800)
         finally:
             reader.close()
         return self._result(task)

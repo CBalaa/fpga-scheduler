@@ -1,4 +1,9 @@
-"""Portable validation for immutable, task-scoped DDR output files."""
+"""Portable validation for immutable, task-scoped DDR output files.
+
+The limits are the UART protocol ceiling from `remote.runner`, not a deployment
+policy: `resident.max_output_bytes` is the (smaller or equal) per-deployment cap
+enforced by `uvhs_session.capture_outputs` before any DDR read happens.
+"""
 import re
 
 from .remote.runner import MAX_OUTPUT_BYTES, MAX_OUTPUTS, output_declaration, output_name

@@ -144,7 +144,7 @@ class BoardTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
         self.backend = ResidentSimulator((Node('sim', (4, 5)),), self.root / 'state',
-                                         startup_timeout=2, command_timeout=.2,
+                                         startup_timeout=2, command_timeout=.2, load_timeout=.2,
                                          uart_quiet_seconds=.02, recovery_backoff=.01)
         self.images = Images(self.root / 'state/images')
         self.index = 0
@@ -212,11 +212,49 @@ class BoardTests(unittest.TestCase):
         self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
         self.assertTrue(self.run_scenario(port=5)['exit_code'] == 0)
 
-    def test_missing_command_ack_quarantines_and_never_releases_cpu(self):
+    def test_missing_memory_command_ack_recovers_before_next_application(self):
+        session, sibling = self.backend.sessions[4], self.backend.sessions[5]
         result = self.run_scenario(mode='command-timeout', duration=.4)
         self.assertEqual(result['execution_status'], 'platform_error', result)
         self.assertFalse(result['details']['application_started'])
-        self.assertEqual(self.backend.states[4]['state'], 'QUARANTINED')
+        self.assertEqual(result['details']['memory_ack_timeout'], 'writemem')
+        self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+        self.assertFalse((session.directory / 'running').exists())
+        eventually(lambda: all(p['available'] for p in self.backend.probe('sim')))
+        current = self.backend.sessions[4]
+        self.assertNotEqual(current.epoch, session.epoch)
+        self.assertIsNotNone(session.process.poll())
+        self.assertIs(self.backend.sessions[5], sibling)
+        result = self.run_scenario(label='after-memory-recovery')
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertEqual(result['details']['session'], current.epoch)
+
+    def test_output_readmem_ack_timeout_rebuilds_shell_and_preserves_failed_result(self):
+        session, sibling = self.backend.sessions[4], self.backend.sessions[5]
+        session.command('rename readmem original_readmem\n'
+                        'proc readmem {args} {if {$::released} {after 2000}; original_readmem {*}$args}')
+        outputs = [dict(version=1, name='result', address='0x80001000', nbytes=4, dtype='<u4',
+                        shape=[1], data='2a000000')]
+        result = self.run_scenario(outputs=outputs)
+        self.assertEqual(result['execution_status'], 'platform_error', result)
+        self.assertEqual(result['app_exit_code'], 0)
+        self.assertTrue(result['details']['application_started'])
+        self.assertEqual(result['details']['memory_ack_timeout'], 'readmem')
+        self.assertEqual(result['details']['interrupted_status'], 'timeout')
+        self.assertIn('artifact_error', result['details'])
+        self.assertFalse(result.get('artifacts'))
+        self.assertEqual(self.backend.states[4]['state'], 'RECOVERING')
+        eventually(lambda: all(p['available'] for p in self.backend.probe('sim')))
+        current = self.backend.sessions[4]
+        self.assertNotEqual(current.epoch, session.epoch)
+        self.assertIsNotNone(session.process.poll())
+        self.assertIs(self.backend.sessions[5], sibling)
+        result = self.run_scenario(outputs=outputs)
+        self.assertEqual(result['exit_code'], 0, result)
+        self.assertEqual(result['details']['session'], current.epoch)
+        self.assertEqual(len(result['artifacts']), 1)
+        artifact = self.backend.artifact_path(f'{self.index:032x}', 'result')
+        self.assertEqual(artifact.read_bytes(), bytes.fromhex('2a000000'))
 
     def test_disconnect_and_uvhs_exit_are_platform_faults(self):
         for port, mode in ((4, 'disconnect'), (5, 'uvhs-exit')):

@@ -94,17 +94,51 @@ fpga-scheduler download <任务ID> C ./C.bin
 `[resident]` 的配置默认如下；修改需正常停止 daemon、修改配置后重新启动：
 
 ```toml
-output_ddr_base = 0x80000000
-output_ddr_bytes = 4194304
-max_output_bytes = 16777216
+output_ddr_base = 0x80000000    # i_ddr[0] 对应的物理地址，必须 64 字节对齐
+output_ddr_bytes = 4194304      # 允许的物理 DDR 窗口，64 的倍数，上限 2 GiB
+output_ddr_read_mode = "prefix" # "prefix" 或 "window"
+max_output_bytes = 16777216     # 每任务导出总量，上限 256 MiB
 ```
 
-物理基地址固定为 `0x80000000`；默认允许前 4 MiB。`output_ddr_bytes` 必须为
-64 的倍数，上限 256 MiB，管理员应按实际硬件映射和应用布局设定。
-每任务最多 16 个输出，累计最多 `max_output_bytes`（上限 16 MiB）。
-daemon 使用已验证的 `i_ddr[N:0]` 前缀读回，随后按声明地址精确切片；
-读取量为 DDR 基地址至最高输出末尾、向上对齐 64 字节。因此远离基地址的小输出
-也会增加抓取时间和临时存储。存储限额为抓取预留快照及输出空间，不删除活动任务输入。
+物理窗口为 `[output_ddr_base, output_ddr_base + output_ddr_bytes)`。base 不再强制
+0x80000000，但必须与硬件工程的 DDR 映射一致，且 base + span 不超过 4 GiB
+地址空间；默认允许前 4 MiB。每任务最多 16 个输出，累计最多 `max_output_bytes`
+（默认 16 MiB，上限 256 MiB）。声明地址必须落在配置窗口内，否则任务在抓取阶段失败。
+单个输出的 nbytes 同样受 256 MiB 协议上限约束。
+
+### 读取模式：prefix 与 window
+
+- `prefix`（默认，已板测）：从 base 开始用 `i_ddr[N:0]` 读回直到最高输出末尾，
+  再按声明地址精确切片。语义与历史镜像读回一致，但快照大小和读回时间随输出地址
+  增长；输出位于 base+622 MiB 时需要约 622 MiB 快照并占用存储配额，不推荐用于
+  远地址输出。
+- `window`：只读覆盖所有输出的 64 字节对齐区间
+  `[对齐下取整(最小地址), 对齐上取整(最大结束))`，Tcl 形如
+  `readmem -rtl nanhu_xilinx.i_ddr[high:low] -file ... -file_type bin`。
+  远地址输出只需读取其附近的少量 64 字节元素，例如 logits 在 0xa6e00080 时只读
+  其所在元素范围。该模式依赖非零 RTL 切片，而历史镜像读回只验证过 `[N:0]`；
+  必须在目标机器上完成一次 A/B 校验后才能用于生产任务（见下节）。
+
+### 启用 window 模式前的一次性硬件校验
+
+1. 正常停止 daemon，保持 `output_ddr_read_mode = "prefix"`，把
+   `output_ddr_bytes` 扩大到覆盖目标输出地址（logits 在 0xa6e00080 时至少
+   `0x26e00080 + 输出长度`，向上取 64 的倍数），确认 base+span <= 4 GiB 后启动。
+2. 运行一个在已知较高地址声明输出的 bin（例如
+   [DDR 输出示例](../examples/ddr_output/README.md) 或模型自带的 logits 导出），
+   用 `fpga-scheduler artifacts <id>` 记录 `address/nbytes/sha256` 并下载保存。
+3. 正常停止 daemon，把配置改为 `output_ddr_read_mode = "window"`，窗口可缩小到
+   刚好覆盖同一输出，再启动。
+4. 用同一程序、同一输入重新执行，比较两次 artifact 的 sha256 与字节。全部一致才
+   可保留 window 模式；不一致立即回退 prefix，并把两次 address、dtype/shape、
+   控制日志和 artifact 哈希交给硬件/厂商排查。
+5. DDR 装载的 `verify_readback` 与输出读取是两条独立路径，前者不能证明后者正确；
+   首次启用 window 后仍建议保留 `verify_readback = true`。
+
+prefix 模式按整个配置窗口（`output_ddr_bytes`）预留抓取快照空间，window 模式按
+`max_output_bytes` 量级预留；详细预算见
+[存储、验收与限制](resident-runtime.md#存储验收与限制)。存储限额为抓取预留快照及输出空间，
+不删除活动任务输入。
 
 UART 声明格式如下，位于 START 与 RESULT 之间，以换行结束：
 
